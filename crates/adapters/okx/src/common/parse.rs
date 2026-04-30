@@ -257,6 +257,9 @@ pub fn okx_status_to_market_action(status: OKXInstrumentStatus) -> MarketStatusA
         OKXInstrumentStatus::Suspend => MarketStatusAction::Suspend,
         OKXInstrumentStatus::Preopen => MarketStatusAction::PreOpen,
         OKXInstrumentStatus::Test => MarketStatusAction::NotAvailableForTrading,
+        // OKX post_only: only post-only limit orders are accepted; market/IOC/FOK/normal-limit
+        // orders are rejected. Maps to Quoting ("instrument is quoting but not trading").
+        OKXInstrumentStatus::PostOnly => MarketStatusAction::Quoting,
     }
 }
 
