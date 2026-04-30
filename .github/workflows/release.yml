@@ -60,12 +60,22 @@ jobs:
         id: owner
         run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
+      - name: Stage wheel into a non-ignored directory
+        # `dist/` is excluded by the upstream .dockerignore (line 77),
+        # so docker build cannot see the wheel. Move it into a directory
+        # that the .dockerignore does not list.
+        run: |
+          rm -rf wheel-context
+          mkdir wheel-context
+          cp dist/*.whl wheel-context/
+          ls -la wheel-context/
+
       - name: Build wheel-only OCI image
         run: |
           cat > Dockerfile.wheel <<'EOF'
           # syntax=docker/dockerfile:1
           FROM scratch
-          COPY dist/*.whl /wheels/
+          COPY wheel-context/*.whl /wheels/
           EOF
           docker build -f Dockerfile.wheel \
             -t ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ steps.ver.outputs.version }} \
