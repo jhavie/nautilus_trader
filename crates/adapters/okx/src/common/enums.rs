@@ -305,6 +305,11 @@ pub enum OKXInstrumentStatus {
     Suspend,
     Preopen,
     Test,
+    /// Post-only state (OKX 2026-04-29 changelog, production date May 2026).
+    /// Only post-only limit orders are accepted; existing post-only
+    /// orders can be amended and cancelled. Other order types
+    /// (market, IOC, FOK, normal limit) are rejected. Only applicable to SWAP.
+    PostOnly,
 }
 
 /// Represents an instrument contract type on OKX.
@@ -735,7 +740,10 @@ mod tests {
     use nautilus_model::enums::{GreeksConvention, OptionKind, OrderStatus};
     use rstest::rstest;
 
-    use super::{OKXGreeksType, OKXOptionType, OKXOrderStatus, OKXOrderType, OKXTriggerType};
+    use super::{
+        OKXGreeksType, OKXInstrumentStatus, OKXOptionType, OKXOrderStatus, OKXOrderType,
+        OKXTriggerType,
+    };
 
     #[rstest]
     fn test_okx_trigger_type_from_str_accepts_snake_case_values() {
@@ -836,6 +844,23 @@ mod tests {
     ) {
         let actual: Result<OKXOrderStatus, OrderStatus> = input.try_into();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_instrument_status_serde_roundtrip() {
+        let variants: &[(OKXInstrumentStatus, &str)] = &[
+            (OKXInstrumentStatus::Live, r#""live""#),
+            (OKXInstrumentStatus::Suspend, r#""suspend""#),
+            (OKXInstrumentStatus::Preopen, r#""preopen""#),
+            (OKXInstrumentStatus::Test, r#""test""#),
+            (OKXInstrumentStatus::PostOnly, r#""post_only""#),
+        ];
+        for (variant, json) in variants {
+            let serialized = serde_json::to_string(variant).unwrap();
+            assert_eq!(&serialized, json);
+            let deserialized: OKXInstrumentStatus = serde_json::from_str(json).unwrap();
+            assert_eq!(deserialized, *variant);
+        }
     }
 }
 
