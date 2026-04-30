@@ -1,0 +1,91 @@
+name: Release wheel to GHCR
+
+# Builds a Linux x86_64 manylinux wheel on every `v*` tag push,
+# packs it into a scratch-based OCI image, and pushes to
+# ghcr.io/<owner>/nautilus-trader-wheel:<version> for downstream
+# projects (e.g. nautilus_quants) to consume via multi-stage COPY:
+#
+#   FROM ghcr.io/<owner>/nautilus-trader-wheel:1.226.1 AS wheel
+#   FROM python:3.12-slim AS builder
+#   COPY --from=wheel /wheels/*.whl /tmp/
+#   RUN uv pip install /tmp/*.whl --force-reinstall --no-deps
+#
+# This is a fork-only workflow used to publish hotfix wheels (e.g.
+# v1.226.1) ahead of upstream releases.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # for GitHub Release upload
+  packages: write   # for GHCR push
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain (matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build wheel (linux x86_64 manylinux)
+        run: BUILD_MODE=release uv build --wheel --out-dir dist/
+
+      - name: Verify wheel imports cleanly
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          pip install dist/*.whl --no-deps
+          python -c "import nautilus_trader; print('version:', nautilus_trader.__version__)"
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Lowercase repository owner (GHCR requires lowercase)
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel-only OCI image
+        run: |
+          cat > Dockerfile.wheel <<'EOF'
+          # syntax=docker/dockerfile:1
+          FROM scratch
+          COPY dist/*.whl /wheels/
+          EOF
+          docker build -f Dockerfile.wheel \
+            -t ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ steps.ver.outputs.version }} \
+            -t ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:latest \
+            .
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        run: |
+          docker push ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ steps.ver.outputs.version }}
+          docker push ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:latest
+
+      - name: Attach wheel to GitHub Release (backup)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
