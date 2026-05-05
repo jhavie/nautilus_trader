@@ -310,6 +310,9 @@ pub enum OKXInstrumentStatus {
     /// orders can be amended and cancelled. Other order types
     /// (market, IOC, FOK, normal limit) are rejected. Only applicable to SWAP.
     PostOnly,
+    /// Rebase state (OKX 2026-03-04 changelog).
+    /// Instruments cannot be traded during rebasing. Only applicable to SWAP.
+    Rebase,
 }
 
 /// Represents an instrument contract type on OKX.
@@ -854,6 +857,7 @@ mod tests {
             (OKXInstrumentStatus::Preopen, r#""preopen""#),
             (OKXInstrumentStatus::Test, r#""test""#),
             (OKXInstrumentStatus::PostOnly, r#""post_only""#),
+            (OKXInstrumentStatus::Rebase, r#""rebase""#),
         ];
         for (variant, json) in variants {
             let serialized = serde_json::to_string(variant).unwrap();

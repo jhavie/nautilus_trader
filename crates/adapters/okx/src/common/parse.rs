@@ -260,6 +260,8 @@ pub fn okx_status_to_market_action(status: OKXInstrumentStatus) -> MarketStatusA
         // OKX post_only: only post-only limit orders are accepted; market/IOC/FOK/normal-limit
         // orders are rejected. Maps to Quoting ("instrument is quoting but not trading").
         OKXInstrumentStatus::PostOnly => MarketStatusAction::Quoting,
+        // OKX rebase: SWAP instrument cannot be traded during rebasing.
+        OKXInstrumentStatus::Rebase => MarketStatusAction::NotAvailableForTrading,
     }
 }
 
@@ -2810,6 +2812,17 @@ mod tests {
         assert_eq!(instrument.min_notional(), None);
         assert_eq!(instrument.max_price(), None);
         assert_eq!(instrument.min_price(), None);
+    }
+
+    #[rstest]
+    fn test_deserialize_swap_instrument_with_rebase_state() {
+        let json_data = load_test_json("http_get_instruments_swap.json");
+        let mut value: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+        value["data"][0]["state"] = serde_json::Value::String("rebase".to_string());
+
+        let response: OKXResponse<OKXInstrument> = serde_json::from_value(value).unwrap();
+
+        assert_eq!(response.data[0].inst_id, "BTC-USD-SWAP");
     }
 
     #[rstest]
