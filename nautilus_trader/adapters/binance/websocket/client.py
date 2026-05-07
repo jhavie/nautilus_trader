@@ -61,6 +61,7 @@ class BinanceWebSocketClient:
 
     MAX_SUBSCRIPTIONS_PER_CLIENT = 200
     MAX_CLIENTS = 20  # Allows up to 4000 total subscriptions (20 x 200)
+    SUBSCRIBE_BATCH_DELAY_SECONDS = 0.05
 
     def __init__(
         self,
@@ -85,6 +86,8 @@ class BinanceWebSocketClient:
         self._clients: dict[int, WebSocketClient | None] = {}  # Client ID -> WebSocket client
         self._client_streams: dict[int, list[str]] = {}  # Client ID -> streams
         self._is_connecting: dict[int, bool] = {}  # Client ID -> is_connecting flag
+        self._pending_subscribe_streams: dict[int, list[str]] = {}
+        self._subscribe_batch_tasks: dict[int, asyncio.Task] = {}
         self._msg_id: int = 0
         self._next_client_id: int = 0
 
@@ -279,6 +282,7 @@ class BinanceWebSocketClient:
             return
 
         self._log.warning(f"ws-client {client_id}: Reconnected to {self._base_url}")
+        self._pending_subscribe_streams.pop(client_id, None)
 
         # Re-subscribe to all streams for this client
         streams = self._client_streams[client_id]
@@ -300,11 +304,55 @@ class BinanceWebSocketClient:
         await self._send(client_id, msg)
         self._log.debug(f"ws-client {client_id}: Resubscribed to {len(streams)} streams")
 
+    def _schedule_subscribe_batch(self, client_id: int) -> None:
+        task = self._subscribe_batch_tasks.get(client_id)
+        if task is not None and not task.done():
+            return
+
+        task = self._loop.create_task(self._flush_subscribe_batch(client_id))
+        self._subscribe_batch_tasks[client_id] = task
+        self._tasks.add(task)
+        task.add_done_callback(
+            lambda done_task, client_id=client_id: self._clear_subscribe_batch_task(
+                client_id,
+                done_task,
+            ),
+        )
+
+    def _clear_subscribe_batch_task(self, client_id: int, task: asyncio.Task) -> None:
+        if self._subscribe_batch_tasks.get(client_id) is task:
+            self._subscribe_batch_tasks.pop(client_id, None)
+
+    async def _flush_subscribe_batch(self, client_id: int) -> None:
+        await asyncio.sleep(self.SUBSCRIBE_BATCH_DELAY_SECONDS)
+
+        while True:
+            while self._is_connecting.get(client_id):
+                await asyncio.sleep(0.01)
+
+            streams = self._pending_subscribe_streams.pop(client_id, [])
+            if not streams:
+                return
+
+            if client_id not in self._clients or self._clients[client_id] is None:
+                await self._connect_client(client_id, streams)
+            else:
+                msg = self._create_subscribe_msg(streams=streams)
+                await self._send(client_id, msg)
+                self._log.debug(
+                    f"ws-client {client_id}: Subscribed to {len(streams)} streams",
+                )
+
+            if not self._pending_subscribe_streams.get(client_id):
+                return
+
     async def disconnect(self) -> None:
         """
         Disconnect all clients from the server.
         """
         await cancel_tasks_with_timeout(self._tasks, self._log)
+        self._pending_subscribe_streams.clear()
+        self._subscribe_batch_tasks.clear()
 
         tasks = []
         for client_id in list(self._clients.keys()):
@@ -633,10 +681,9 @@ class BinanceWebSocketClient:
             await self._connect_client(client_id, [stream])
             return
 
-        # Otherwise, send subscription message to existing client
-        msg = self._create_subscribe_msg(streams=[stream])
-        await self._send(client_id, msg)
-        self._log.debug(f"ws-client {client_id}: Subscribed to {stream}")
+        # Otherwise, queue a batched subscription message for the existing client.
+        self._pending_subscribe_streams.setdefault(client_id, []).append(stream)
+        self._schedule_subscribe_batch(client_id)
 
     async def _unsubscribe(self, stream: str) -> None:
         if stream not in self._streams:
@@ -656,6 +703,19 @@ class BinanceWebSocketClient:
         # Remove from client's streams list
         if client_id in self._client_streams and stream in self._client_streams[client_id]:
             self._client_streams[client_id].remove(stream)
+
+        pending = self._pending_subscribe_streams.get(client_id)
+        if pending is not None and stream in pending:
+            pending.remove(stream)
+            if not pending:
+                self._pending_subscribe_streams.pop(client_id, None)
+            self._log.debug(f"ws-client {client_id}: Removed pending subscription to {stream}")
+            if client_id in self._client_streams and not self._client_streams[client_id]:
+                await self._disconnect_client(client_id)
+                self._log.debug(
+                    f"ws-client {client_id}: Disconnected due to no remaining subscriptions",
+                )
+            return
 
         # Send unsubscribe message
         msg = self._create_unsubscribe_msg(streams=[stream])
