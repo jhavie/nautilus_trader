@@ -8740,6 +8740,7 @@ class OKXHttpClient:
         instrument_id: InstrumentId,
         algo_id: str,
         new_trigger_price: Price | None = None,
+        new_sl_trigger_price: Price | None = None,
         new_limit_price: Price | None = None,
         new_quantity: Quantity | None = None,
         new_callback_ratio: str | None = None,

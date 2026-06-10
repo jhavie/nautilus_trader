@@ -1869,11 +1869,18 @@ class OKXExecutionClient(LiveExecutionClient):
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
             command.instrument_id.value,
         )
-        new_trigger_price = (
+        trigger_price = (
             nautilus_pyo3.Price.from_str(str(command.trigger_price))
             if command.trigger_price
             else None
         )
+        # A conditional stop-loss algo order (incl. closeFraction close-position
+        # stops) is amended via `newSlTriggerPx`, not `newTriggerPx`. Strategies
+        # flag such orders with `params={"sl_trigger": True}`; plain trigger algo
+        # orders keep using `newTriggerPx`.
+        sl_trigger = bool(command.params.get("sl_trigger")) if command.params else False
+        new_trigger_price = None if sl_trigger else trigger_price
+        new_sl_trigger_price = trigger_price if sl_trigger else None
         new_limit_price = (
             nautilus_pyo3.Price.from_str(str(command.price)) if command.price else None
         )
@@ -1890,6 +1897,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 instrument_id=pyo3_instrument_id,
                 algo_id=algo_id,
                 new_trigger_price=new_trigger_price,
+                new_sl_trigger_price=new_sl_trigger_price,
                 new_limit_price=new_limit_price,
                 new_quantity=new_quantity,
             )

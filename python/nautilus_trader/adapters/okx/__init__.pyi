@@ -286,6 +286,7 @@ class OKXHttpClient:
         instrument_id: model.InstrumentId,
         algo_id: str,
         new_trigger_price: model.Price | None = None,
+        new_sl_trigger_price: model.Price | None = None,
         new_limit_price: model.Price | None = None,
         new_quantity: model.Quantity | None = None,
         new_callback_ratio: str | None = None,
