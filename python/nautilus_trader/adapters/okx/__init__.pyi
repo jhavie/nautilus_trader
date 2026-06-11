@@ -286,12 +286,12 @@ class OKXHttpClient:
         instrument_id: model.InstrumentId,
         algo_id: str,
         new_trigger_price: model.Price | None = None,
-        new_sl_trigger_price: model.Price | None = None,
         new_limit_price: model.Price | None = None,
         new_quantity: model.Quantity | None = None,
         new_callback_ratio: str | None = None,
         new_callback_spread: str | None = None,
         new_activation_price: model.Price | None = None,
+        new_sl_trigger_price: model.Price | None = None,
     ) -> typing.Any: ...
     def cancel_algo_orders(
         self, orders: typing.Sequence[tuple[model.InstrumentId, str]]

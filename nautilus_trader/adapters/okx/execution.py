@@ -1878,7 +1878,7 @@ class OKXExecutionClient(LiveExecutionClient):
         # stops) is amended via `newSlTriggerPx`, not `newTriggerPx`. Strategies
         # flag such orders with `params={"sl_trigger": True}`; plain trigger algo
         # orders keep using `newTriggerPx`.
-        sl_trigger = bool(command.params.get("sl_trigger")) if command.params else False
+        sl_trigger = self._parse_sl_trigger_param(command.params)
         new_trigger_price = None if sl_trigger else trigger_price
         new_sl_trigger_price = trigger_price if sl_trigger else None
         new_limit_price = (
@@ -2339,6 +2339,21 @@ class OKXExecutionClient(LiveExecutionClient):
 
     def _is_conditional_order(self, order: Order) -> bool:
         return order.order_type in self._OKX_CONDITIONAL_ORDER_TYPES
+
+    @staticmethod
+    def _parse_sl_trigger_param(params: dict[str, Any] | None) -> bool:
+        if not params or "sl_trigger" not in params:
+            return False
+
+        value = params["sl_trigger"]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes")
+
+        return False
 
     def _submit_order_route(
         self,

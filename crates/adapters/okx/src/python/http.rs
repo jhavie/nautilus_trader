@@ -1205,12 +1205,12 @@ impl OKXHttpClient {
         instrument_id,
         algo_id,
         new_trigger_price=None,
-        new_sl_trigger_price=None,
         new_limit_price=None,
         new_quantity=None,
         new_callback_ratio=None,
         new_callback_spread=None,
         new_activation_price=None,
+        new_sl_trigger_price=None,
     ))]
     fn py_amend_algo_order<'py>(
         &self,
@@ -1218,12 +1218,12 @@ impl OKXHttpClient {
         instrument_id: InstrumentId,
         algo_id: String,
         new_trigger_price: Option<Price>,
-        new_sl_trigger_price: Option<Price>,
         new_limit_price: Option<Price>,
         new_quantity: Option<Quantity>,
         new_callback_ratio: Option<String>,
         new_callback_spread: Option<String>,
         new_activation_price: Option<Price>,
+        new_sl_trigger_price: Option<Price>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
