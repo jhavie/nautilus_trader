@@ -1578,7 +1578,7 @@ wheels = [
 
 [[package]]
 name = "nautilus-trader"
-version = "1.228.0"
+version = "1.228.1"
 source = { editable = "." }
 dependencies = [
     { name = "click" },

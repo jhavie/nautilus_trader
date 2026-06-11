@@ -1899,6 +1899,7 @@ class OKXExecutionClient(LiveExecutionClient):
         new_tp_trigger_px_type = None
         new_sl_order_price = None
         new_sl_trigger_px_type = None
+
         if is_attached_oco_tp:
             new_tp_order_price = (
                 str(command.price)
