@@ -1879,11 +1879,44 @@ class OKXExecutionClient(LiveExecutionClient):
         # flag such orders with `params={"sl_trigger": True}`; plain trigger algo
         # orders keep using `newTriggerPx`.
         sl_trigger = self._parse_sl_trigger_param(command.params)
-        new_trigger_price = None if sl_trigger else trigger_price
-        new_sl_trigger_price = trigger_price if sl_trigger else None
-        new_limit_price = (
-            nautilus_pyo3.Price.from_str(str(command.price)) if command.price else None
+        binding = self._attached_oco_binding(order.client_order_id)
+        is_attached_oco_sl = (
+            binding is not None and binding.sl_client_order_id == order.client_order_id
         )
+        is_attached_oco_tp = (
+            binding is not None and binding.tp_client_order_id == order.client_order_id
+        )
+        is_attached_oco_child = is_attached_oco_sl or is_attached_oco_tp
+        new_trigger_price = None if sl_trigger or is_attached_oco_child else trigger_price
+        new_tp_trigger_price = trigger_price if is_attached_oco_tp else None
+        new_sl_trigger_price = trigger_price if sl_trigger or is_attached_oco_sl else None
+        new_limit_price = (
+            nautilus_pyo3.Price.from_str(str(command.price))
+            if command.price and not is_attached_oco_child
+            else None
+        )
+        new_tp_order_price = None
+        new_tp_trigger_px_type = None
+        new_sl_order_price = None
+        new_sl_trigger_px_type = None
+        if is_attached_oco_tp:
+            new_tp_order_price = (
+                str(command.price)
+                if command.price
+                else "-1"
+                if order.order_type == OrderType.MARKET_IF_TOUCHED
+                else None
+            )
+            new_tp_trigger_px_type = self._okx_trigger_type_str(order)
+        elif is_attached_oco_sl:
+            new_sl_order_price = (
+                str(command.price)
+                if command.price
+                else "-1"
+                if order.order_type == OrderType.STOP_MARKET
+                else None
+            )
+            new_sl_trigger_px_type = self._okx_trigger_type_str(order)
         new_quantity = (
             nautilus_pyo3.Quantity.from_str(str(command.quantity)) if command.quantity else None
         )
@@ -1900,6 +1933,11 @@ class OKXExecutionClient(LiveExecutionClient):
                 new_sl_trigger_price=new_sl_trigger_price,
                 new_limit_price=new_limit_price,
                 new_quantity=new_quantity,
+                new_tp_trigger_price=new_tp_trigger_price,
+                new_tp_order_price=new_tp_order_price,
+                new_tp_trigger_px_type=new_tp_trigger_px_type,
+                new_sl_order_price=new_sl_order_price,
+                new_sl_trigger_px_type=new_sl_trigger_px_type,
             )
 
             s_code = resp.get("s_code", "0")

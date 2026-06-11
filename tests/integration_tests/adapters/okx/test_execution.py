@@ -1410,6 +1410,92 @@ async def test_modify_algo_order_http_routes_sl_trigger_price(
 
 
 @pytest.mark.asyncio
+async def test_modify_attached_oco_sl_child_routes_sl_trigger_and_market_price(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    _, entry_order, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    client._register_attached_oco_binding(entry_order, sl_order, tp_order)
+    client._algo_order_ids[sl_order.client_order_id] = "algo-oco-1"
+    http_client.amend_algo_order = AsyncMock(return_value={"s_code": "0"})
+    command = ModifyOrder(
+        trader_id=sl_order.trader_id,
+        strategy_id=sl_order.strategy_id,
+        instrument_id=instrument.id,
+        client_order_id=sl_order.client_order_id,
+        venue_order_id=None,
+        quantity=None,
+        price=None,
+        trigger_price=Price.from_str("38800.00"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params=None,
+    )
+
+    # Act
+    await client._modify_algo_order_http(command, sl_order)
+
+    # Assert
+    http_client.amend_algo_order.assert_awaited_once()
+    call = http_client.amend_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["new_trigger_price"] is None
+    assert call.kwargs["new_tp_trigger_price"] is None
+    assert str(call.kwargs["new_sl_trigger_price"]) == "38800.00"
+    assert call.kwargs["new_sl_order_price"] == "-1"
+    assert call.kwargs["new_sl_trigger_px_type"] == "last"
+
+
+@pytest.mark.asyncio
+async def test_modify_attached_oco_tp_child_routes_tp_trigger_and_market_price(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    _, entry_order, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    client._register_attached_oco_binding(entry_order, sl_order, tp_order)
+    client._algo_order_ids[tp_order.client_order_id] = "algo-oco-1"
+    http_client.amend_algo_order = AsyncMock(return_value={"s_code": "0"})
+    command = ModifyOrder(
+        trader_id=tp_order.trader_id,
+        strategy_id=tp_order.strategy_id,
+        instrument_id=instrument.id,
+        client_order_id=tp_order.client_order_id,
+        venue_order_id=None,
+        quantity=None,
+        price=None,
+        trigger_price=Price.from_str("42000.00"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params=None,
+    )
+
+    # Act
+    await client._modify_algo_order_http(command, tp_order)
+
+    # Assert
+    http_client.amend_algo_order.assert_awaited_once()
+    call = http_client.amend_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["new_trigger_price"] is None
+    assert str(call.kwargs["new_tp_trigger_price"]) == "42000.00"
+    assert call.kwargs["new_tp_order_price"] == "-1"
+    assert call.kwargs["new_tp_trigger_px_type"] == "last"
+    assert call.kwargs["new_sl_trigger_price"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("raw_sl_trigger", [False, "false", "0", 0])
 async def test_modify_algo_order_http_does_not_treat_false_like_sl_trigger(
     exec_client_builder,
@@ -1456,6 +1542,11 @@ def test_amend_algo_order_stubs_preserve_positional_argument_order():
         "new_callback_spread",
         "new_activation_price",
         "new_sl_trigger_price",
+        "new_tp_trigger_price",
+        "new_tp_order_price",
+        "new_tp_trigger_px_type",
+        "new_sl_order_price",
+        "new_sl_trigger_px_type",
     )
 
     for stub_path in stub_paths:

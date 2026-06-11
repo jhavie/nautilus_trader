@@ -8746,6 +8746,11 @@ class OKXHttpClient:
         new_callback_spread: str | None = None,
         new_activation_price: Price | None = None,
         new_sl_trigger_price: Price | None = None,
+        new_tp_trigger_price: Price | None = None,
+        new_tp_order_price: str | None = None,
+        new_tp_trigger_px_type: str | None = None,
+        new_sl_order_price: str | None = None,
+        new_sl_trigger_px_type: str | None = None,
     ) -> Any: ...
     async def cancel_advance_algo_order(
         self,
