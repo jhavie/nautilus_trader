@@ -624,6 +624,57 @@ class OKXExecutionClient(LiveExecutionClient):
 
         return None
 
+    def _algo_id_recovery_client_order_ids(self, order: Order) -> list[ClientOrderId]:
+        binding = self._attached_oco_binding(order.client_order_id)
+        source_client_order_ids = (
+            binding.all_client_order_ids() if binding is not None else (order.client_order_id,)
+        )
+
+        recovery_client_order_ids: list[ClientOrderId] = []
+        for client_order_id in source_client_order_ids:
+            for candidate in (
+                self._canonical_client_order_id(client_order_id),
+                self._exchange_client_order_id(client_order_id),
+                client_order_id,
+            ):
+                if candidate is not None and candidate not in recovery_client_order_ids:
+                    recovery_client_order_ids.append(candidate)
+
+        return recovery_client_order_ids
+
+    async def _recover_algo_id_by_client_order_id(
+        self,
+        order: Order,
+        pyo3_instrument_id: nautilus_pyo3.InstrumentId,
+    ) -> str | None:
+        for candidate in self._algo_id_recovery_client_order_ids(order):
+            report = await self._fetch_algo_order_status_report(
+                candidate,
+                pyo3_instrument_id,
+            )
+            if report is None or report.venue_order_id is None:
+                continue
+
+            algo_id = str(report.venue_order_id)
+            canonical = (
+                self._canonical_client_order_id(report.client_order_id)
+                or self._canonical_client_order_id(candidate)
+                or candidate
+            )
+            self._algo_order_ids[canonical] = algo_id
+            self._algo_order_instruments[canonical] = order.instrument_id
+
+            if candidate != canonical:
+                self._algo_order_ids[candidate] = algo_id
+                self._algo_order_instruments[candidate] = order.instrument_id
+
+            self._log.debug(
+                f"Recovered OKX algo_id {algo_id} from algoClOrdId {candidate!r}",
+            )
+            return algo_id
+
+        return None
+
     async def _fetch_algo_order_status_report(
         self,
         query_client_order_id: ClientOrderId,
@@ -1850,7 +1901,16 @@ class OKXExecutionClient(LiveExecutionClient):
             await self._modify_order_websocket(command, order)
 
     async def _modify_algo_order_http(self, command: ModifyOrder, order: Order) -> None:
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
+            command.instrument_id.value,
+        )
         algo_id = self._resolve_algo_id(order)
+        if not algo_id:
+            algo_id = await self._recover_algo_id_by_client_order_id(
+                order,
+                pyo3_instrument_id,
+            )
+
         if not algo_id:
             self._log.error(
                 f"Cannot amend pending algo order {command.client_order_id!r}: "
@@ -1866,9 +1926,6 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             return
 
-        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
-            command.instrument_id.value,
-        )
         trigger_price = (
             nautilus_pyo3.Price.from_str(str(command.trigger_price))
             if command.trigger_price
