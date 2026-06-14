@@ -1410,6 +1410,57 @@ async def test_modify_algo_order_http_routes_sl_trigger_price(
 
 
 @pytest.mark.asyncio
+async def test_modify_algo_order_http_recovers_algo_id_by_algo_client_order_id(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    order, command = _build_stop_market_modify_order_pair(
+        instrument.id,
+        params={"sl_trigger": True},
+    )
+    pyo3_report = nautilus_pyo3.OrderStatusReport(
+        account_id=nautilus_pyo3.AccountId("OKX-master"),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId("algo-recovered-1"),
+        client_order_id=nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+        order_side=nautilus_pyo3.OrderSide.SELL,
+        order_type=nautilus_pyo3.OrderType.STOP_MARKET,
+        time_in_force=nautilus_pyo3.TimeInForce.GTC,
+        order_status=nautilus_pyo3.OrderStatus.ACCEPTED,
+        quantity=nautilus_pyo3.Quantity.from_str("0.010000"),
+        filled_qty=nautilus_pyo3.Quantity.from_str("0"),
+        trigger_price=nautilus_pyo3.Price.from_str("39000.00"),
+        trigger_type=nautilus_pyo3.TriggerType.DEFAULT,
+        reduce_only=True,
+        ts_accepted=0,
+        ts_last=0,
+        report_id=nautilus_pyo3.UUID4(),
+        ts_init=0,
+    )
+    http_client.request_algo_order_status_report = AsyncMock(return_value=pyo3_report)
+    http_client.amend_algo_order = AsyncMock(return_value={"s_code": "0"})
+
+    # Act
+    await client._modify_algo_order_http(command, order)
+
+    # Assert
+    http_client.request_algo_order_status_report.assert_awaited_once()
+    http_client.amend_algo_order.assert_awaited_once()
+    call = http_client.amend_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["algo_id"] == "algo-recovered-1"
+    assert call.kwargs["new_trigger_price"] is None
+    assert str(call.kwargs["new_sl_trigger_price"]) == "38800.00"
+    assert client._algo_order_ids[order.client_order_id] == "algo-recovered-1"
+
+
+@pytest.mark.asyncio
 async def test_modify_attached_oco_sl_child_routes_sl_trigger_and_market_price(
     exec_client_builder,
     monkeypatch,
