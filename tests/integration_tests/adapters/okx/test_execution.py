@@ -182,6 +182,41 @@ def _build_bracket_order_list(
     )
 
 
+def _build_stop_market_modify_order_pair(
+    instrument_id: InstrumentId,
+    *,
+    params: dict | None = None,
+) -> tuple[StopMarketOrder, ModifyOrder]:
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument_id,
+        client_order_id=ClientOrderId("O-sl-trigger"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("0.010000"),
+        trigger_price=Price.from_str("39000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=None,
+        quantity=None,
+        price=None,
+        trigger_price=Price.from_str("38800.00"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params=params,
+    )
+    return order, command
+
+
 def _add_open_position(
     client: OKXExecutionClient,
     instrument,
@@ -1400,6 +1435,34 @@ def test_merge_attach_algo_ords_rejects_bracket_and_params_overlap():
     # Act, Assert
     with pytest.raises(ValueError, match="cannot be combined"):
         OKXExecutionClient._merge_attach_algo_ords(bracket_attach_algo_ords, params)
+
+
+@pytest.mark.asyncio
+async def test_modify_algo_order_http_routes_sl_trigger_param_to_sl_amend_field(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # A closeFraction STOP_MARKET is placed as an OKX conditional SL using
+    # slTriggerPx, so the amend must use newSlTriggerPx instead of newTriggerPx.
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    order, command = _build_stop_market_modify_order_pair(
+        instrument.id,
+        params={"sl_trigger": True},
+    )
+    client._algo_order_ids[order.client_order_id] = "algo-123"
+    http_client.amend_algo_order = AsyncMock(return_value={"s_code": "0"})
+
+    await client._modify_algo_order_http(command, order)
+
+    http_client.amend_algo_order.assert_awaited_once()
+    call = http_client.amend_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["new_trigger_price"] is None
+    assert str(call.kwargs["new_sl_trigger_price"]) == "38800.00"
 
 
 @pytest.mark.asyncio
