@@ -313,6 +313,53 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
 
 
 @pytest.mark.asyncio
+async def test_generate_order_status_reports_includes_open_algo_orders(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+
+    regular_report = MagicMock(name="regular-report")
+    algo_report = MagicMock(name="algo-report")
+    expected_regular = MagicMock(name="expected-regular")
+    expected_algo = MagicMock(name="expected-algo")
+    converted = {
+        regular_report: expected_regular,
+        algo_report: expected_algo,
+    }
+    monkeypatch.setattr(
+        "nautilus_trader.adapters.okx.execution.OrderStatusReport.from_pyo3",
+        lambda obj: converted[obj],
+    )
+    monkeypatch.setattr(client, "_hydrate_zero_quantity_algo_report", lambda obj: obj)
+
+    http_client.request_order_status_reports.return_value = [regular_report]
+    http_client.request_algo_order_status_reports.return_value = [algo_report]
+
+    instrument_id = InstrumentId(Symbol("BTC-USD"), OKX_VENUE)
+    command = GenerateOrderStatusReports(
+        instrument_id=instrument_id,
+        start=None,
+        end=None,
+        open_only=True,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    reports = await client.generate_order_status_reports(command)
+
+    # Assert
+    assert reports == [expected_regular, expected_algo]
+    http_client.request_algo_order_status_reports.assert_awaited_once_with(
+        account_id=client.pyo3_account_id,
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument_id.value),
+        state=nautilus_pyo3.OKXOrderStatus.LIVE,
+    )
+
+
+@pytest.mark.asyncio
 async def test_generate_order_status_reports_load_spreads_uses_generic_request(
     exec_client_builder,
     monkeypatch,
