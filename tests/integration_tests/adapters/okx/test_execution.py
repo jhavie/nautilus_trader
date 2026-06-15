@@ -460,6 +460,45 @@ async def test_generate_order_status_reports_hydrates_zero_quantity_algo_from_po
 
 
 @pytest.mark.asyncio
+async def test_generate_order_status_reports_registers_algo_id_for_open_algo_order(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    client._cache.add_instrument(instrument)
+    _add_open_position(client, instrument, Quantity.from_int(100))
+
+    client_order_id = ClientOrderId("O-external-stop")
+    http_client.request_order_status_reports.return_value = []
+    http_client.request_algo_order_status_reports.return_value = [
+        _zero_quantity_algo_status_report(
+            client,
+            instrument.id,
+            client_order_id=client_order_id.value,
+        ),
+    ]
+
+    command = GenerateOrderStatusReports(
+        instrument_id=instrument.id,
+        start=None,
+        end=None,
+        open_only=True,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    reports = await client.generate_order_status_reports(command)
+
+    # Assert
+    assert len(reports) == 1
+    assert client._algo_order_ids[client_order_id] == "algo-external-stop"
+    assert client._algo_order_instruments[client_order_id] == instrument.id
+
+
+@pytest.mark.asyncio
 async def test_generate_order_status_reports_skips_unhydratable_zero_quantity_algo(
     exec_client_builder,
     monkeypatch,
