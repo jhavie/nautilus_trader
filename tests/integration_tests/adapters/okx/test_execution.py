@@ -355,7 +355,6 @@ async def test_generate_order_status_reports_includes_open_algo_orders(
     http_client.request_algo_order_status_reports.assert_awaited_once_with(
         account_id=client.pyo3_account_id,
         instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument_id.value),
-        state=nautilus_pyo3.OKXOrderStatus.LIVE,
     )
 
 
