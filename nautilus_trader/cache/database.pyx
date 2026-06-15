@@ -45,6 +45,7 @@ from nautilus_trader.model.events.order cimport OrderInitialized
 from nautilus_trader.model.functions cimport currency_type_from_str
 from nautilus_trader.model.functions cimport currency_type_to_str
 from nautilus_trader.model.functions cimport order_type_to_str
+from nautilus_trader.model.functions cimport trigger_type_from_str
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ClientOrderId
@@ -63,6 +64,7 @@ from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.orders.base cimport Order
 from nautilus_trader.model.orders.limit cimport LimitOrder
 from nautilus_trader.model.orders.market cimport MarketOrder
+from nautilus_trader.model.orders.stop_market cimport StopMarketOrder
 from nautilus_trader.model.orders.unpacker cimport OrderUnpacker
 from nautilus_trader.model.position cimport Position
 from nautilus_trader.serialization.base cimport Serializer
@@ -696,6 +698,14 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
                 elif event.order_type == OrderType.LIMIT:
                     price = Price.from_str_c(event.options["price"])
                     order = LimitOrder.transform(order, event.ts_init, price)
+                elif event.order_type == OrderType.STOP_MARKET:
+                    price = Price.from_str_c(event.options["trigger_price"])
+                    order = StopMarketOrder.transform(
+                        order,
+                        event.ts_init,
+                        price,
+                        trigger_type_from_str(event.options["trigger_type"]),
+                    )
                 else:
                     raise RuntimeError(  # pragma: no cover (design-time error)
                         f"Cannot transform order to {order_type_to_str(event.order_type)}",  # pragma: no cover (design-time error)
