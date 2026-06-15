@@ -478,7 +478,6 @@ class OKXExecutionClient(LiveExecutionClient):
                     algo_response = await self._http_client.request_algo_order_status_reports(
                         account_id=self.pyo3_account_id,
                         instrument_id=pyo3_instrument_id,
-                        state=nautilus_pyo3.OKXOrderStatus.LIVE,
                     )
                     pyo3_reports.extend(algo_response)
             else:
@@ -495,7 +494,6 @@ class OKXExecutionClient(LiveExecutionClient):
                         algo_response = await self._http_client.request_algo_order_status_reports(
                             account_id=self.pyo3_account_id,
                             instrument_type=instrument_type,
-                            state=nautilus_pyo3.OKXOrderStatus.LIVE,
                         )
                         pyo3_reports.extend(algo_response)
 
