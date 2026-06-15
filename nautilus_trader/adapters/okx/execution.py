@@ -457,7 +457,7 @@ class OKXExecutionClient(LiveExecutionClient):
             "...",
         )
 
-        pyo3_reports: list[nautilus_pyo3.OrderStatusReport] = []
+        pyo3_reports: list[tuple[nautilus_pyo3.OrderStatusReport, bool]] = []
         reports: list[OrderStatusReport] = []
 
         try:
@@ -473,13 +473,13 @@ class OKXExecutionClient(LiveExecutionClient):
                     end=ensure_pydatetime_utc(command.end),
                     open_only=command.open_only,
                 )
-                pyo3_reports.extend(response)
+                pyo3_reports.extend((report, False) for report in response)
                 if command.open_only:
                     algo_response = await self._http_client.request_algo_order_status_reports(
                         account_id=self.pyo3_account_id,
                         instrument_id=pyo3_instrument_id,
                     )
-                    pyo3_reports.extend(algo_response)
+                    pyo3_reports.extend((report, True) for report in algo_response)
             else:
                 for instrument_type in self._config.instrument_types:
                     response = await self._http_client.request_order_status_reports(
@@ -489,13 +489,13 @@ class OKXExecutionClient(LiveExecutionClient):
                         end=ensure_pydatetime_utc(command.end),
                         open_only=command.open_only,
                     )
-                    pyo3_reports.extend(response)
+                    pyo3_reports.extend((report, False) for report in response)
                     if command.open_only:
                         algo_response = await self._http_client.request_algo_order_status_reports(
                             account_id=self.pyo3_account_id,
                             instrument_type=instrument_type,
                         )
-                        pyo3_reports.extend(algo_response)
+                        pyo3_reports.extend((report, True) for report in algo_response)
 
                 if self._config.load_spreads:
                     response = await self._http_client.request_order_status_reports(
@@ -504,9 +504,9 @@ class OKXExecutionClient(LiveExecutionClient):
                         end=ensure_pydatetime_utc(command.end),
                         open_only=command.open_only,
                     )
-                    pyo3_reports.extend(response)
+                    pyo3_reports.extend((report, False) for report in response)
 
-            for pyo3_report in pyo3_reports:
+            for pyo3_report, is_algo_report in pyo3_reports:
                 pyo3_report = self._hydrate_zero_quantity_algo_report(pyo3_report)
                 if Decimal(str(pyo3_report.quantity)) == 0:
                     self._log.warning(
@@ -518,6 +518,8 @@ class OKXExecutionClient(LiveExecutionClient):
 
                 report = OrderStatusReport.from_pyo3(pyo3_report)
                 self._apply_client_order_alias(report)
+                if is_algo_report:
+                    self._register_algo_order_id_from_report(report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
         except (asyncio.CancelledError, Exception) as e:
@@ -2414,6 +2416,25 @@ class OKXExecutionClient(LiveExecutionClient):
             return value.strip().lower() in ("1", "true", "yes")
 
         return False
+
+    def _register_algo_order_id_from_report(self, report: OrderStatusReport) -> None:
+        if report.client_order_id is None or report.venue_order_id is None:
+            return
+        if report.order_type not in self._OKX_CONDITIONAL_ORDER_TYPES:
+            return
+        if report.order_status in (
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.FILLED,
+        ):
+            return
+
+        client_order_id = (
+            self._canonical_client_order_id(report.client_order_id) or report.client_order_id
+        )
+        self._algo_order_ids[client_order_id] = str(report.venue_order_id)
+        self._algo_order_instruments[client_order_id] = report.instrument_id
 
     def _submit_order_route(
         self,
