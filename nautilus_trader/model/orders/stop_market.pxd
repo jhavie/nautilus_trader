@@ -31,3 +31,6 @@ cdef class StopMarketOrder(Order):
 
     @staticmethod
     cdef StopMarketOrder create_c(OrderInitialized init)
+
+    @staticmethod
+    cdef StopMarketOrder transform(Order order, uint64_t ts_init, Price trigger_price=*, TriggerType trigger_type=*)
