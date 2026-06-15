@@ -34,6 +34,7 @@ from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
+from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
@@ -43,6 +44,7 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
@@ -53,6 +55,7 @@ from nautilus_trader.model.orders import MarketIfTouchedOrder
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.orders import OrderList
 from nautilus_trader.model.orders import StopMarketOrder
+from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
@@ -176,6 +179,70 @@ def _build_bracket_order_list(
         entry_order,
         sl_order,
         tp_order,
+    )
+
+
+def _add_open_position(
+    client: OKXExecutionClient,
+    instrument,
+    quantity: Quantity,
+) -> Position:
+    order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-position-entry"),
+        order_side=OrderSide.BUY,
+        quantity=quantity,
+        time_in_force=TimeInForce.GTC,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=client.account_id,
+            venue_order_id=VenueOrderId("position-entry"),
+        ),
+    )
+    order.apply(
+        TestEventStubs.order_filled(
+            order,
+            instrument=instrument,
+            account_id=client.account_id,
+            position_id=PositionId("P-position-entry"),
+            last_px=instrument.make_price(1),
+        ),
+    )
+    position = Position(instrument=instrument, fill=order.last_event)
+    client._cache.add_position(position, OmsType.NETTING)
+    return position
+
+
+def _zero_quantity_algo_status_report(
+    client: OKXExecutionClient,
+    instrument_id: InstrumentId,
+    client_order_id: str = "O-external-stop",
+) -> nautilus_pyo3.OrderStatusReport:
+    return nautilus_pyo3.OrderStatusReport(
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument_id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId("algo-external-stop"),
+        client_order_id=nautilus_pyo3.ClientOrderId(client_order_id),
+        order_side=nautilus_pyo3.OrderSide.SELL,
+        order_type=nautilus_pyo3.OrderType.STOP_MARKET,
+        time_in_force=nautilus_pyo3.TimeInForce.GTC,
+        order_status=nautilus_pyo3.OrderStatus.ACCEPTED,
+        quantity=nautilus_pyo3.Quantity.from_str("0"),
+        filled_qty=nautilus_pyo3.Quantity.from_str("0"),
+        trigger_price=nautilus_pyo3.Price.from_str("0.90000"),
+        trigger_type=nautilus_pyo3.TriggerType.DEFAULT,
+        reduce_only=True,
+        ts_accepted=0,
+        ts_last=0,
+        report_id=nautilus_pyo3.UUID4(),
+        ts_init=0,
     )
 
 
@@ -320,6 +387,69 @@ async def test_generate_order_status_reports_includes_open_algo_orders(
         account_id=client.pyo3_account_id,
         instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument_id.value),
     )
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_hydrates_zero_quantity_algo_from_position(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    client._cache.add_instrument(instrument)
+    position = _add_open_position(client, instrument, Quantity.from_int(100))
+
+    http_client.request_order_status_reports.return_value = []
+    http_client.request_algo_order_status_reports.return_value = [
+        _zero_quantity_algo_status_report(client, instrument.id),
+    ]
+
+    command = GenerateOrderStatusReports(
+        instrument_id=instrument.id,
+        start=None,
+        end=None,
+        open_only=True,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    reports = await client.generate_order_status_reports(command)
+
+    # Assert
+    assert len(reports) == 1
+    assert reports[0].instrument_id == instrument.id
+    assert reports[0].quantity == position.quantity
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_skips_unhydratable_zero_quantity_algo(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
+    instrument_id = InstrumentId(Symbol("BTC-USD"), OKX_VENUE)
+    http_client.request_order_status_reports.return_value = []
+    http_client.request_algo_order_status_reports.return_value = [
+        _zero_quantity_algo_status_report(client, instrument_id),
+    ]
+
+    command = GenerateOrderStatusReports(
+        instrument_id=instrument_id,
+        start=None,
+        end=None,
+        open_only=True,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    reports = await client.generate_order_status_reports(command)
+
+    # Assert
+    assert reports == []
 
 
 @pytest.mark.asyncio

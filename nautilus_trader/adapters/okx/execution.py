@@ -508,6 +508,14 @@ class OKXExecutionClient(LiveExecutionClient):
 
             for pyo3_report in pyo3_reports:
                 pyo3_report = self._hydrate_zero_quantity_algo_report(pyo3_report)
+                if Decimal(str(pyo3_report.quantity)) == 0:
+                    self._log.warning(
+                        "Skipping zero-quantity OKX order status report "
+                        f"for client_order_id={pyo3_report.client_order_id!r}, "
+                        f"venue_order_id={pyo3_report.venue_order_id!r}",
+                    )
+                    continue
+
                 report = OrderStatusReport.from_pyo3(pyo3_report)
                 self._apply_client_order_alias(report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
@@ -2542,7 +2550,7 @@ class OKXExecutionClient(LiveExecutionClient):
             return pyo3_report
 
         if pyo3_report.client_order_id is None:
-            return pyo3_report
+            return self._hydrate_zero_quantity_algo_report_from_position(pyo3_report)
 
         report_client_order_id = ClientOrderId(pyo3_report.client_order_id.value)
         canonical_client_order_id = (
@@ -2550,13 +2558,51 @@ class OKXExecutionClient(LiveExecutionClient):
         )
         order = self._cache.order(canonical_client_order_id)
         if order is None or not self._is_conditional_order(order):
-            return pyo3_report
+            return self._hydrate_zero_quantity_algo_report_from_position(pyo3_report)
 
         self._log.debug(
             f"Hydrating zero-quantity OKX algo report for {canonical_client_order_id!r} "
             f"from cached quantity {order.quantity}",
         )
 
+        return self._copy_order_status_report_with_quantity(pyo3_report, order.quantity)
+
+    def _hydrate_zero_quantity_algo_report_from_position(
+        self,
+        pyo3_report: nautilus_pyo3.OrderStatusReport,
+    ) -> nautilus_pyo3.OrderStatusReport:
+        try:
+            instrument_id = InstrumentId.from_str(pyo3_report.instrument_id.value)
+            account_id = AccountId(pyo3_report.account_id.value)
+            positions = self._cache.positions_open(
+                instrument_id=instrument_id,
+                account_id=account_id,
+            )
+            if not positions:
+                positions = self._cache.positions_open(instrument_id=instrument_id)
+        except Exception as e:  # pragma: no cover - defensive around live cache state
+            self._log.debug(f"Cannot inspect positions for zero-quantity OKX algo report: {e}")
+            return pyo3_report
+
+        if len(positions) != 1:
+            self._log.debug(
+                "Cannot hydrate zero-quantity OKX algo report from open position: "
+                f"found {len(positions)} positions for {pyo3_report.instrument_id!r}",
+            )
+            return pyo3_report
+
+        position = positions[0]
+        self._log.debug(
+            "Hydrating zero-quantity OKX algo report "
+            f"for {pyo3_report.client_order_id!r} from open position quantity {position.quantity}",
+        )
+        return self._copy_order_status_report_with_quantity(pyo3_report, position.quantity)
+
+    @staticmethod
+    def _copy_order_status_report_with_quantity(
+        pyo3_report: nautilus_pyo3.OrderStatusReport,
+        quantity: Quantity,
+    ) -> nautilus_pyo3.OrderStatusReport:
         return nautilus_pyo3.OrderStatusReport(
             account_id=pyo3_report.account_id,
             instrument_id=pyo3_report.instrument_id,
@@ -2566,7 +2612,7 @@ class OKXExecutionClient(LiveExecutionClient):
             order_type=pyo3_report.order_type,
             time_in_force=pyo3_report.time_in_force,
             order_status=pyo3_report.order_status,
-            quantity=nautilus_pyo3.Quantity.from_str(str(order.quantity)),
+            quantity=nautilus_pyo3.Quantity.from_str(str(quantity)),
             filled_qty=pyo3_report.filled_qty,
             report_id=pyo3_report.report_id,
             ts_accepted=pyo3_report.ts_accepted,
