@@ -363,3 +363,70 @@ cdef class StopMarketOrder(Order):
     @staticmethod
     def create(init):
         return StopMarketOrder.create_c(init)
+
+    @staticmethod
+    cdef StopMarketOrder transform(
+        Order order,
+        uint64_t ts_init,
+        Price trigger_price = None,
+        TriggerType trigger_type = TriggerType.NO_TRIGGER,
+    ):
+        """
+        Transform the given order to a `stop-market` order.
+
+        All existing events will be prepended to the orders internal events
+        prior to the new `OrderInitialized` event.
+        """
+        Condition.not_none(order, "order")
+        Condition.is_true(trigger_price or hasattr(order, "trigger_price"), "`order` has no trigger_price")
+
+        cdef TriggerType resolved_trigger_type = trigger_type
+        if resolved_trigger_type == TriggerType.NO_TRIGGER and hasattr(order, "trigger_type"):
+            resolved_trigger_type = order.trigger_type
+
+        cdef StopMarketOrder transformed = StopMarketOrder(
+            trader_id=order.trader_id,
+            strategy_id=order.strategy_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            order_side=order.side,
+            quantity=order.quantity,
+            trigger_price=trigger_price or order.trigger_price,
+            trigger_type=resolved_trigger_type,
+            time_in_force=order.time_in_force,
+            expire_time_ns=order.expire_time_ns if hasattr(order, "expire_time_ns") else 0,
+            reduce_only=order.is_reduce_only,
+            quote_quantity=order.is_quote_quantity,
+            init_id=UUID4(),
+            ts_init=ts_init,
+            emulation_trigger=order.emulation_trigger,
+            trigger_instrument_id=order.trigger_instrument_id,
+            contingency_type=order.contingency_type,
+            order_list_id=order.order_list_id,
+            linked_order_ids=order.linked_order_ids,
+            parent_order_id=order.parent_order_id,
+            exec_algorithm_id=order.exec_algorithm_id,
+            exec_algorithm_params=order.exec_algorithm_params,
+            exec_spawn_id=order.exec_spawn_id,
+            tags=order.tags,
+        )
+        transformed.liquidity_side = order.liquidity_side
+        cdef Price triggered_price = order.get_triggered_price_c()
+        if triggered_price:
+            transformed.set_triggered_price_c(triggered_price)
+
+        # Use original order initialization timestamp
+        transformed.ts_init = order.ts_init
+
+        Order._hydrate_initial_events(original=order, transformed=transformed)
+
+        return transformed
+
+    @staticmethod
+    def transform_py(
+        Order order,
+        uint64_t ts_init,
+        Price trigger_price = None,
+        TriggerType trigger_type = TriggerType.NO_TRIGGER,
+    ) -> StopMarketOrder:
+        return StopMarketOrder.transform(order, ts_init, trigger_price, trigger_type)

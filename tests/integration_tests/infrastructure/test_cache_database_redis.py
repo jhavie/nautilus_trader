@@ -51,6 +51,7 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.orders import MarketOrder
+from nautilus_trader.model.orders import StopMarketOrder
 from nautilus_trader.model.position import Position
 from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
 from nautilus_trader.portfolio.portfolio import Portfolio
@@ -855,6 +856,30 @@ class TestCacheDatabaseAdapter:
         # Assert
         assert result == order
         assert result.order_type == OrderType.LIMIT
+
+    @pytest.mark.asyncio
+    async def test_load_order_when_transformed_to_stop_market_order_in_database_returns_order(self):
+        # Arrange
+        order = self.strategy.order_factory.limit(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+
+        order = StopMarketOrder.transform_py(order, 0, Price.from_str("1.00000"))
+
+        self.database.add_order(order)
+
+        # Allow MPSC thread to insert
+        await eventually(lambda: self.database.load_order(order.client_order_id))
+
+        # Act
+        result = self.database.load_order(order.client_order_id)
+
+        # Assert
+        assert result == order
+        assert result.order_type == OrderType.STOP_MARKET
 
     @pytest.mark.asyncio
     async def test_load_order_when_stop_market_order_in_database_returns_order(self):
