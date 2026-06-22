@@ -198,7 +198,7 @@ parquet = { version = "58.3.0", default-features = false, features = [
   "async",
 ] }
 pem = "3.0.6"
-pyo3 = { version = "0.28.3", default-features = false, features = [
+pyo3 = { version = "0.29.0", default-features = false, features = [
   "chrono",
   "hashbrown",
   "indexmap",
@@ -207,7 +207,7 @@ pyo3 = { version = "0.28.3", default-features = false, features = [
   "rust_decimal",
   "serde",
 ] }
-pyo3-async-runtimes = { version = "0.28.0", default-features = false, features = [
+pyo3-async-runtimes = { version = "0.29.0", default-features = false, features = [
   "attributes",
   "tokio",
   "tokio-runtime",
@@ -386,6 +386,10 @@ turmoil = "0.7.2"
 capnpc = "0.25.3"
 cbindgen = "0.29.3"
 walkdir = "2.5.0"
+
+[patch.crates-io]
+# Keep the pinned pyo3-stub-gen buildable with PyO3 0.29 API and exception alias changes.
+pyo3-stub-gen = { path = "patches/pyo3-stub-gen" }
 
 # -----------------------------------------------------------------------------
 # Tools (for cargo install, used by Makefile and CI)
