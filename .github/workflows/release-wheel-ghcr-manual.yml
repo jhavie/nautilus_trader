@@ -1,0 +1,122 @@
+# Copyright (c) 2025 nautilus_trader
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+name: Release wheel to GHCR manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to build, for example v1.229.1
+        required: true
+        default: v1.229.1
+      version:
+        description: Package/image version tag, without leading v
+        required: true
+        default: 1.229.1
+      push_latest:
+        description: Also update ghcr.io/.../nautilus-trader-wheel:latest
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain (matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.23"
+
+      - name: Build wheel
+        run: BUILD_MODE=release uv build --wheel --out-dir dist/
+
+      - name: Verify wheel imports cleanly
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          pip install dist/*.whl --no-deps
+          python -c "import nautilus_trader; print('version:', nautilus_trader.__version__)"
+
+      - name: Validate requested version
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import tomllib
+          with pathlib.Path("pyproject.toml").open("rb") as fh:
+              version = tomllib.load(fh)["project"]["version"]
+          expected = "${{ inputs.version }}"
+          if version != expected:
+              raise SystemExit(f"version mismatch: pyproject={version} input={expected}")
+          PY
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage wheel into OCI context
+        run: |
+          set -euo pipefail
+          rm -rf wheel-context
+          mkdir wheel-context
+          cp dist/*.whl wheel-context/
+          ls -la wheel-context/
+
+      - name: Build wheel-only OCI image
+        run: |
+          set -euo pipefail
+          cat > Dockerfile.wheel <<'EOF'
+          # syntax=docker/dockerfile:1
+          FROM scratch
+          COPY wheel-context/*.whl /wheels/
+          EOF
+          docker build -f Dockerfile.wheel \
+            -t ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ inputs.version }} \
+            .
+          if [ "${{ inputs.push_latest }}" = "true" ]; then
+            docker tag \
+              ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ inputs.version }} \
+              ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:latest
+          fi
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        run: |
+          set -euo pipefail
+          docker push ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ inputs.version }}
+          if [ "${{ inputs.push_latest }}" = "true" ]; then
+            docker push ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:latest
+          fi
+
+      - name: Attach wheel to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.source_ref }}
+          files: dist/*.whl
+          generate_release_notes: true
