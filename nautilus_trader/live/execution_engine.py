@@ -1140,6 +1140,13 @@ class LiveExecutionEngine(ExecutionEngine):
                 f"cached_qty=0 (flat), venue_qty={venue_qty}; querying for missing fills...",
                 LogColor.YELLOW,
             )
+            self._msgbus.publish(
+                topic=(
+                    f"reports.execution."
+                    f"{venue_report.instrument_id.venue}.{venue_report.instrument_id.symbol}"
+                ),
+                msg=venue_report,
+            )
 
             missing_fills, had_fill_query_errors = await self._query_and_find_missing_fills(
                 instrument_id,

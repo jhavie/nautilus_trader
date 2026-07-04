@@ -4907,6 +4907,52 @@ async def test_process_venue_reported_positions_venue_has_position(
 
 
 @pytest.mark.asyncio
+async def test_process_venue_reported_positions_publishes_venue_only_position_report(
+    live_exec_engine,
+    exec_client,
+    cache,
+    account_id,
+):
+    """
+    Test venue-only position discrepancies publish the native PositionStatusReport.
+    """
+    # Arrange
+    live_exec_engine.register_client(exec_client)
+
+    if AUDUSD_SIM.id not in [i.id for i in cache.instruments()]:
+        cache.add_instrument(AUDUSD_SIM)
+
+    venue_report = PositionStatusReport(
+        account_id=account_id,
+        instrument_id=AUDUSD_SIM.id,
+        position_side=PositionSide.LONG,
+        quantity=Quantity.from_int(1000),
+        report_id=UUID4(),
+        ts_last=live_exec_engine._clock.timestamp_ns(),
+        ts_init=live_exec_engine._clock.timestamp_ns(),
+    )
+    published_reports = []
+    live_exec_engine._msgbus.subscribe(
+        topic=f"reports.execution.{AUDUSD_SIM.id.venue}.{AUDUSD_SIM.id.symbol}",
+        handler=published_reports.append,
+    )
+
+    async def no_missing_fills(instrument_id, clients):
+        return [], False
+
+    live_exec_engine._query_and_find_missing_fills = no_missing_fills
+
+    # Act
+    await live_exec_engine._process_venue_reported_positions(
+        {},
+        {(AUDUSD_SIM.id, venue_report.account_id): venue_report},
+    )
+
+    # Assert
+    assert published_reports == [venue_report]
+
+
+@pytest.mark.asyncio
 async def test_process_venue_reported_positions_processes_each_account_independently(
     live_exec_engine,
     exec_client,
