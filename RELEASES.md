@@ -1,3 +1,30 @@
+# NautilusTrader 1.230.1 Fork
+
+Released on 4th July 2026 (UTC).
+
+Fork release based on upstream NautilusTrader `v1.230.0`, with the jhavie OKX
+and cache hotfix set rebased for production breakout usage.
+
+### Fork Fixes
+- Include open OKX algo orders in status report generation.
+- Omit `state` when requesting pending OKX algo reconciliation.
+- Restore transformed `STOP_MARKET` orders from the cache database.
+- Hydrate zero-quantity OKX algo reports from open position quantity when
+  possible, and skip unhydratable zero-quantity reports.
+- Retain reconciled OKX algo IDs and instrument mappings for later amend/cancel
+  operations.
+- Preserve conditional stop amend routing tests on top of upstream `v1.230.0`,
+  which already includes the official OKX conditional and attached TP/SL amend
+  field fix.
+
+### Breaking Changes Inherited From 1.230.0
+- This fork inherits upstream `v1.230.0` breaking changes, including regenerated
+  beta `event_store` data for v1.227-v1.229 stores, non-zero Rust `Throttler`
+  rate-limit accessors, and the Bybit data config rename from
+  `instrument_status_poll_secs` to `instrument_poll_interval_secs`.
+
+---
+
 # NautilusTrader 1.230.0 Beta
 
 Released on 29th June 2026 (UTC).
