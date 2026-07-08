@@ -29,23 +29,32 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source ref
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
+      - name: Get Rust toolchain version
+        run: echo "TOOLCHAIN=$(bash scripts/rust-toolchain.sh)" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain (matches rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          override: true
+          cache: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.11.18"
+          enable-cache: false
 
       - name: Build wheel
         run: BUILD_MODE=release uv build --wheel --out-dir dist/
@@ -58,14 +67,17 @@ jobs:
           python -c "import nautilus_trader; print('version:', nautilus_trader.__version__)"
 
       - name: Validate requested version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           python - <<'PY'
+          import os
           import pathlib
           import tomllib
           with pathlib.Path("pyproject.toml").open("rb") as fh:
               version = tomllib.load(fh)["project"]["version"]
-          expected = "${{ inputs.version }}"
+          expected = os.environ["EXPECTED_VERSION"]
           if version != expected:
               raise SystemExit(f"version mismatch: pyproject={version} input={expected}")
           PY
@@ -83,6 +95,10 @@ jobs:
           ls -la wheel-context/
 
       - name: Build wheel-only OCI image
+        env:
+          IMAGE_OWNER: ${{ steps.owner.outputs.name }}
+          IMAGE_VERSION: ${{ inputs.version }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           set -euo pipefail
           cat > Dockerfile.wheel <<'EOF'
@@ -90,32 +106,38 @@ jobs:
           FROM scratch
           COPY wheel-context/*.whl /wheels/
           EOF
+          image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:${IMAGE_VERSION}"
+          latest_image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:latest"
           docker build -f Dockerfile.wheel \
-            -t ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ inputs.version }} \
+            -t "$image" \
             .
-          if [ "${{ inputs.push_latest }}" = "true" ]; then
-            docker tag \
-              ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ inputs.version }} \
-              ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:latest
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker tag "$image" "$latest_image"
           fi
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push to GHCR
+        env:
+          IMAGE_OWNER: ${{ steps.owner.outputs.name }}
+          IMAGE_VERSION: ${{ inputs.version }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           set -euo pipefail
-          docker push ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:${{ inputs.version }}
-          if [ "${{ inputs.push_latest }}" = "true" ]; then
-            docker push ghcr.io/${{ steps.owner.outputs.name }}/nautilus-trader-wheel:latest
+          image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:${IMAGE_VERSION}"
+          latest_image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:latest"
+          docker push "$image"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker push "$latest_image"
           fi
 
       - name: Attach wheel to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ inputs.source_ref }}
           files: dist/*.whl
