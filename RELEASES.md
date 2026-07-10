@@ -1,3 +1,20 @@
+# NautilusTrader 1.230.3 Fork
+
+Released on 10th July 2026 (UTC).
+
+Fork patch release based on `v1.230.2` for safe OKX live position
+reconciliation.
+
+### Fork Fixes
+- Propagate failed OKX position status queries after logging them so the live
+  execution engine can mark the venue query as failed and skip reconciliation.
+- Prevent temporary OKX REST/API failures from being interpreted as a genuine
+  flat venue position and generating an inferred closing fill.
+- Preserve the `v1.230.2` venue-only position report publication behavior and
+  all prior fork-specific OKX algo reconciliation fixes.
+
+---
+
 # NautilusTrader 1.230.1 Fork
 
 Released on 4th July 2026 (UTC).
