@@ -1008,6 +1008,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 reports.append(report)
         except (asyncio.CancelledError, Exception) as e:
             self._log_report_error(e, "PositionReports")
+            raise
 
         self._log_report_receipt(
             len(reports),
