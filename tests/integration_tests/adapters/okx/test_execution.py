@@ -787,10 +787,16 @@ async def test_handle_fill_report_updates_venue_id_before_fill(exec_client_build
 
 
 @pytest.mark.asyncio
-async def test_generate_position_status_reports_handles_failure(exec_client_builder, monkeypatch):
+async def test_generate_position_status_reports_propagates_failure(
+    exec_client_builder,
+    monkeypatch,
+):
     # Arrange
-    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_position_status_reports.side_effect = Exception("boom")
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    http_client.request_position_status_reports.side_effect = RuntimeError("boom")
 
     command = GeneratePositionStatusReports(
         instrument_id=None,
@@ -800,11 +806,11 @@ async def test_generate_position_status_reports_handles_failure(exec_client_buil
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await client.generate_position_status_reports(command)
 
-    # Assert
-    assert reports == []
+    http_client.request_position_status_reports.assert_awaited_once()
 
 
 @pytest.mark.asyncio
