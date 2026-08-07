@@ -360,6 +360,7 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
     )
 
     pyo3_report = MagicMock()
+    pyo3_report.quantity = "1"
     http_client.request_order_status_reports.return_value = [pyo3_report]
 
     command = GenerateOrderStatusReports(
@@ -389,6 +390,8 @@ async def test_generate_order_status_reports_includes_open_algo_orders(
 
     regular_report = MagicMock(name="regular-report")
     algo_report = MagicMock(name="algo-report")
+    regular_report.quantity = "1"
+    algo_report.quantity = "1"
     expected_regular = MagicMock(name="expected-regular")
     expected_algo = MagicMock(name="expected-algo")
     converted = {

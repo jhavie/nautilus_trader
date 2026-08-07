@@ -1,0 +1,147 @@
+# Copyright (c) 2025 nautilus_trader
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+name: Release wheel to GHCR manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to build, for example v1.231.1
+        required: true
+        default: v1.231.1
+      version:
+        description: Package/image version tag, without leading v
+        required: true
+        default: 1.231.1
+      push_latest:
+        description: Also update ghcr.io/.../nautilus-trader-wheel:latest
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Get Rust toolchain version
+        run: echo "TOOLCHAIN=$(bash scripts/rust-toolchain.sh)" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (matches rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          override: true
+          cache: false
+
+      - name: Get uv version
+        run: echo "UV_VERSION=$(bash scripts/uv-version.sh)" >> "$GITHUB_ENV"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: Validate requested version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          with pathlib.Path("pyproject.toml").open("rb") as fh:
+              version = tomllib.load(fh)["project"]["version"]
+
+          expected = os.environ["EXPECTED_VERSION"]
+          if version != expected:
+              raise SystemExit(f"version mismatch: pyproject={version} input={expected}")
+          PY
+
+      - name: Build wheel
+        run: BUILD_MODE=release bash scripts/ci/retry-on-corruption.sh uv build --wheel --out-dir dist/
+
+      - name: Verify wheel imports cleanly
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          pip install dist/*.whl --no-deps
+          python -c "import nautilus_trader; print('version:', nautilus_trader.__version__)"
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage wheel into OCI context
+        run: |
+          set -euo pipefail
+          rm -rf wheel-context
+          mkdir wheel-context
+          cp dist/*.whl wheel-context/
+          ls -la wheel-context/
+
+      - name: Build wheel-only OCI image
+        env:
+          IMAGE_OWNER: ${{ steps.owner.outputs.name }}
+          IMAGE_VERSION: ${{ inputs.version }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
+        run: |
+          set -euo pipefail
+          cat > Dockerfile.wheel <<'EOF'
+          # syntax=docker/dockerfile:1
+          FROM scratch
+          COPY wheel-context/*.whl /wheels/
+          EOF
+          image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:${IMAGE_VERSION}"
+          latest_image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:latest"
+          docker build -f Dockerfile.wheel -t "$image" .
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker tag "$image" "$latest_image"
+          fi
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        env:
+          IMAGE_OWNER: ${{ steps.owner.outputs.name }}
+          IMAGE_VERSION: ${{ inputs.version }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:${IMAGE_VERSION}"
+          latest_image="ghcr.io/${IMAGE_OWNER}/nautilus-trader-wheel:latest"
+          docker push "$image"
+          if [ "$PUSH_LATEST" = "true" ]; then
+            docker push "$latest_image"
+          fi
+
+      - name: Attach wheel to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ inputs.source_ref }}
+          files: dist/*.whl
+          generate_release_notes: true

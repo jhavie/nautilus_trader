@@ -1,3 +1,27 @@
+# NautilusTrader 1.231.1 Fork
+
+Released on 7th August 2026 (UTC).
+
+Fork patch release based on upstream NautilusTrader `v1.231.0`, preserving the
+jhavie OKX algo-order, cache restoration, and live reconciliation protections
+used by production breakout and pairs strategies.
+
+### Fork Fixes
+- Include open OKX algo orders in status report generation without filtering
+  pending reconciliation by an incompatible regular-order state.
+- Restore transformed `STOP_MARKET` orders from the cache database.
+- Hydrate zero-quantity OKX algo reports from cached orders or the single open
+  position, and skip reports that cannot be hydrated safely.
+- Retain reconciled OKX algo IDs and instrument mappings for subsequent
+  conditional-stop amend and cancel operations.
+- Preserve conditional-stop amend routing regression coverage.
+- Publish venue-only position reports before missing-fill recovery so strategy
+  protection guards can observe exchange-only positions.
+- Propagate failed OKX position status queries after logging so temporary API
+  failures cannot be interpreted as a genuine flat venue position.
+
+---
+
 # NautilusTrader 1.231.0 Beta
 
 Released on 2nd August 2026 (UTC).
