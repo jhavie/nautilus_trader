@@ -21,9 +21,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nautilus_trader.adapters.binance import execution as binance_execution
 from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
+from nautilus_trader.adapters.binance.common.enums import BinanceErrorCode
+from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
+from nautilus_trader.adapters.binance.common.enums import BinanceOrderStatus
+from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
+from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
+from nautilus_trader.adapters.binance.common.schemas.account import BinanceOrder
 from nautilus_trader.adapters.binance.config import BinanceExecClientConfig
 from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExecutionClient
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
@@ -31,6 +38,8 @@ from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFutu
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesAlgoOrder
 from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesSymbolConfig
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
+from nautilus_trader.adapters.binance.http.error import BinanceError
+from nautilus_trader.adapters.binance.http.error import BinanceServerError
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
@@ -47,6 +56,7 @@ from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
 from nautilus_trader.model.enums import TriggerType
@@ -66,6 +76,14 @@ from nautilus_trader.trading.strategy import Strategy
 
 
 ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
+
+
+def test_unknown_submit_retry_safety_capability_marker_is_enabled():
+    assert binance_execution.BINANCE_UNKNOWN_SUBMIT_RETRY_SAFE is True
+
+
+def test_client_order_id_replay_guard_capability_marker_is_enabled():
+    assert binance_execution.BINANCE_CLIENT_ORDER_ID_REPLAY_GUARD is True
 
 
 class TestBinanceFuturesExecutionClient:
@@ -137,7 +155,11 @@ class TestBinanceFuturesExecutionClient:
             clock=self.clock,
             instrument_provider=self.provider,
             base_url_ws="",
-            config=BinanceExecClientConfig(),
+            config=BinanceExecClientConfig(
+                max_retries=3,
+                retry_delay_initial_ms=1,
+                retry_delay_max_ms=1,
+            ),
             account_type=BinanceAccountType.USDT_FUTURES,
             environment=BinanceEnvironment.LIVE,
             api_key="SOME_BINANCE_API_KEY",
@@ -210,6 +232,454 @@ class TestBinanceFuturesExecutionClient:
         assert request[1]["payload"]["newClientOrderId"] is not None
         assert request[1]["payload"]["recvWindow"] == "5000"
         assert request[1]["payload"]["positionSide"] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error_code",
+        [BinanceErrorCode.UNEXPECTED_RESP, BinanceErrorCode.TIMEOUT],
+    )
+    async def test_submit_unknown_execution_status_is_not_retried_or_rejected(
+        self,
+        mocker,
+        error_code,
+    ):
+        # Arrange
+        order = self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+        submit = AsyncMock(
+            side_effect=BinanceError(
+                status=504,
+                message={
+                    "code": error_code.value,
+                    "msg": "Execution status unknown.",
+                },
+                headers={},
+            ),
+        )
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        # Act
+        await self.exec_client._submit_order_inner(order, position_side=None)
+
+        # Assert
+        submit.assert_awaited_once()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_cancellation_is_not_retried_or_rejected(self, mocker):
+        # Arrange
+        order = self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+        submit = AsyncMock(side_effect=asyncio.CancelledError())
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        # Act
+        await self.exec_client._submit_order_inner(order, position_side=None)
+
+        # Assert
+        submit.assert_awaited_once()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BinanceServerError(status=200, message="Non-JSON response", headers={}),
+            BinanceServerError(status=500, message="Internal server error", headers={}),
+            BinanceError(
+                status=503,
+                message={"code": -1003, "msg": "Service unavailable"},
+                headers={},
+            ),
+        ],
+    )
+    async def test_submit_http_5xx_is_not_retried_or_rejected(self, mocker, error):
+        # Arrange
+        order = self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+        submit = AsyncMock(side_effect=error)
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        # Act
+        await self.exec_client._submit_order_inner(order, position_side=None)
+
+        # Assert
+        submit.assert_awaited_once()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_definitive_retry_error_is_still_retried(self, mocker):
+        # Arrange
+        order = self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+        retryable_error = BinanceError(
+            status=400,
+            message={
+                "code": BinanceErrorCode.INVALID_TIMESTAMP.value,
+                "msg": "Timestamp outside recvWindow.",
+            },
+            headers={},
+        )
+        submit = AsyncMock(side_effect=[retryable_error, None])
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        # Act
+        await self.exec_client._submit_order_inner(order, position_side=None)
+
+        # Assert
+        assert submit.await_count == 2
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    def _exec_client_with_default_submit_policy(self) -> BinanceFuturesExecutionClient:
+        return BinanceFuturesExecutionClient(
+            loop=self.loop,
+            client=self.http_client,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            instrument_provider=self.provider,
+            base_url_ws="",
+            config=BinanceExecClientConfig(
+                max_retries=None,
+                retry_delay_initial_ms=1,
+                retry_delay_max_ms=1,
+            ),
+            account_type=BinanceAccountType.USDT_FUTURES,
+            environment=BinanceEnvironment.LIVE,
+            api_key="SOME_BINANCE_API_KEY",
+            api_secret="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_default_none_does_not_retry_ambiguous_error(self, mocker):
+        client = self._exec_client_with_default_submit_policy()
+        order = self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+        submit = AsyncMock(
+            side_effect=BinanceError(
+                status=504,
+                message={
+                    "code": BinanceErrorCode.TIMEOUT.value,
+                    "msg": "Execution status unknown.",
+                },
+                headers={},
+            ),
+        )
+        client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(client, "generate_order_rejected")
+
+        await client._submit_order_inner(order, position_side=None)
+
+        assert client._submit_retry_manager_pool.max_retries == 0
+        submit.assert_awaited_once()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    @staticmethod
+    def _found_market_order(client_order_id: str) -> BinanceOrder:
+        return BinanceOrder(
+            symbol="ETHUSDT",
+            orderId=12345,
+            clientOrderId=client_order_id,
+            price="0",
+            origQty="1",
+            executedQty="1",
+            status=BinanceOrderStatus.FILLED,
+            timeInForce=BinanceTimeInForce.GTC,
+            type=BinanceOrderType.MARKET,
+            side=BinanceOrderSide.BUY,
+            time=1_700_000_000_000,
+            updateTime=1_700_000_000_001,
+        )
+
+    @staticmethod
+    def _no_such_order() -> BinanceError:
+        return BinanceError(
+            status=400,
+            message={
+                "code": BinanceErrorCode.NO_SUCH_ORDER.value,
+                "msg": "Order does not exist.",
+            },
+            headers={},
+        )
+
+    def _market_order_for_replay_guard(self):
+        return self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_opt_out_does_not_query(self, mocker):
+        order = self._market_order_for_replay_guard()
+        query_order = mocker.patch.object(self.exec_client._http_account, "query_order")
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": False},
+        )
+
+        query_order.assert_not_awaited()
+        submit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_denies_futures_algo_order_before_submitted(self, mocker):
+        order = self.strategy.order_factory.stop_market(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.SELL,
+            quantity=Quantity.from_int(1),
+            trigger_price=Price.from_str("10000"),
+        )
+        query_order = mocker.patch.object(self.exec_client._http_account, "query_order")
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_denied = mocker.patch.object(self.exec_client, "generate_order_denied")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        query_order.assert_not_awaited()
+        submit.assert_not_awaited()
+        generate_submitted.assert_not_called()
+        generate_denied.assert_called_once()
+        assert "standard Binance Futures" in generate_denied.call_args.kwargs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_q1_found_terminal_reconciles_without_post(self, mocker):
+        order = self._market_order_for_replay_guard()
+        found = self._found_market_order(order.client_order_id.value)
+        query_order = mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(return_value=found),
+        )
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        send_report = mocker.patch.object(self.exec_client, "_send_order_status_report")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        query_order.assert_awaited_once_with(
+            symbol=order.instrument_id.symbol.value,
+            orig_client_order_id=order.client_order_id.value,
+            recv_window="5000",
+        )
+        submit.assert_not_awaited()
+        send_report.assert_called_once()
+        assert send_report.call_args.args[0].order_status == OrderStatus.FILLED
+        generate_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_q1_absent_q2_found_reconciles_without_post(self, mocker):
+        order = self._market_order_for_replay_guard()
+        found = self._found_market_order(order.client_order_id.value)
+        query_order = mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(side_effect=[self._no_such_order(), found]),
+        )
+        self.exec_client._client_order_id_replay_guard_started_ms = 0
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        send_report = mocker.patch.object(self.exec_client, "_send_order_status_report")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        assert query_order.await_count == 2
+        submit.assert_not_awaited()
+        send_report.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_double_absent_waits_for_fence_then_posts_once(self, mocker):
+        order = self._market_order_for_replay_guard()
+        query_order = mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(side_effect=[self._no_such_order(), self._no_such_order()]),
+        )
+        self.exec_client._client_order_id_replay_guard_started_ms = self.clock.timestamp_ms()
+        sleep = mocker.patch(
+            "nautilus_trader.adapters.binance.execution.asyncio.sleep", AsyncMock()
+        )
+        send_request = mocker.patch(
+            target="nautilus_trader.adapters.binance.http.client.BinanceHttpClient.send_request",
+        )
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        assert query_order.await_count == 2
+        sleep.assert_awaited_once()
+        wait_seconds = sleep.await_args.args[0]
+        assert 5.9 <= wait_seconds <= 6.0
+        send_request.assert_awaited_once()
+        assert send_request.await_args.args[:2] == (HttpMethod.POST, "/fapi/v1/order")
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_does_not_repeat_post_in_same_client(self, mocker):
+        order = self._market_order_for_replay_guard()
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(
+                side_effect=[
+                    self._no_such_order(),
+                    self._no_such_order(),
+                    self._no_such_order(),
+                    self._no_such_order(),
+                ],
+            ),
+        )
+        self.exec_client._client_order_id_replay_guard_started_ms = 0
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+
+        for _ in range(2):
+            await self.exec_client._submit_order_inner(
+                order,
+                position_side=None,
+                params={"client_order_id_replay_guard": True},
+            )
+
+        submit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_q2_unknown_does_not_post_or_reject(self, mocker):
+        order = self._market_order_for_replay_guard()
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(
+                side_effect=[
+                    self._no_such_order(),
+                    BinanceServerError(
+                        status=200,
+                        message="Non-JSON response",
+                        headers={},
+                    ),
+                ],
+            ),
+        )
+        self.exec_client._client_order_id_replay_guard_started_ms = 0
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        submit.assert_not_awaited()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query_error",
+        [
+            BinanceServerError(status=500, message="Internal server error", headers={}),
+            TimeoutError("query timed out"),
+        ],
+    )
+    async def test_submit_replay_guard_unknown_query_does_not_post_or_reject(
+        self,
+        mocker,
+        query_error,
+    ):
+        order = self._market_order_for_replay_guard()
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(side_effect=query_error),
+        )
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        submit.assert_not_awaited()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_submit_replay_guard_query_cancellation_does_not_post_or_reject(self, mocker):
+        order = self._market_order_for_replay_guard()
+        mocker.patch.object(
+            self.exec_client._http_account,
+            "query_order",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_rejected = mocker.patch.object(self.exec_client, "generate_order_rejected")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        submit.assert_not_awaited()
+        generate_submitted.assert_called_once()
+        generate_rejected.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

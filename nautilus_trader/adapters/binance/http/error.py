@@ -100,3 +100,34 @@ def should_retry(error: BaseException) -> bool:
     """
     error_code = get_binance_error_code(error)
     return error_code in BINANCE_RETRY_ERRORS if error_code else False
+
+
+def is_ambiguous_submit_error(error: BaseException | None) -> bool:
+    """
+    Return whether an order submit result has an unknown execution status.
+
+    Binance explicitly documents ``-1006``, ``-1007``, and all HTTP 5XX
+    responses as execution status unknown. The HTTP client also raises
+    ``BinanceServerError`` when a nominally successful response cannot be
+    decoded, which is equally ambiguous. Replaying a submit after any of
+    these responses can duplicate an order which the venue already accepted.
+
+    """
+    if error is None:
+        return False
+
+    if isinstance(error, BinanceServerError):
+        return True
+
+    if isinstance(error, BinanceError) and 500 <= error.status <= 599:
+        return True
+
+    return get_binance_error_code(error) in {
+        BinanceErrorCode.UNEXPECTED_RESP,
+        BinanceErrorCode.TIMEOUT,
+    }
+
+
+def should_retry_submit_order(error: BaseException) -> bool:
+    """Return whether an order submit can be safely retried."""
+    return not is_ambiguous_submit_error(error) and should_retry(error)

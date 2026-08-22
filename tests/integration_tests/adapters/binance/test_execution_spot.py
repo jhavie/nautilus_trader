@@ -215,6 +215,31 @@ class TestBinanceSpotExecutionClient:
         assert request[1]["payload"]["recvWindow"] == "5000"
 
     @pytest.mark.asyncio
+    async def test_submit_replay_guard_denies_spot_order_before_submitted(self, mocker):
+        order = self.strategy.order_factory.market(
+            instrument_id=ETHUSDT_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+        )
+        query_order = mocker.patch.object(self.exec_client._http_account, "query_order")
+        submit = AsyncMock()
+        self.exec_client._submit_order_method[order.order_type] = submit
+        generate_submitted = mocker.patch.object(self.exec_client, "generate_order_submitted")
+        generate_denied = mocker.patch.object(self.exec_client, "generate_order_denied")
+
+        await self.exec_client._submit_order_inner(
+            order,
+            position_side=None,
+            params={"client_order_id_replay_guard": True},
+        )
+
+        query_order.assert_not_awaited()
+        submit.assert_not_awaited()
+        generate_submitted.assert_not_called()
+        generate_denied.assert_called_once()
+        assert "standard Binance Futures" in generate_denied.call_args.kwargs["reason"]
+
+    @pytest.mark.asyncio
     async def test_submit_limit_order(self, mocker):
         # Arrange
         mock_send_request = mocker.patch(
