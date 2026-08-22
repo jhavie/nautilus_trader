@@ -354,7 +354,7 @@ class TestBinanceFuturesExecutionClient:
         generate_submitted.assert_called_once()
         generate_rejected.assert_not_called()
 
-    def _exec_client_with_default_submit_retries(self) -> BinanceFuturesExecutionClient:
+    def _exec_client_with_default_submit_policy(self) -> BinanceFuturesExecutionClient:
         return BinanceFuturesExecutionClient(
             loop=self.loop,
             client=self.http_client,
@@ -375,52 +375,8 @@ class TestBinanceFuturesExecutionClient:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("order_kind", ["market", "stop_market"])
-    async def test_submit_default_none_retries_definitive_error_three_times(
-        self,
-        mocker,
-        order_kind,
-    ):
-        client = self._exec_client_with_default_submit_retries()
-        if order_kind == "market":
-            order = self.strategy.order_factory.market(
-                instrument_id=ETHUSDT_PERP_BINANCE.id,
-                order_side=OrderSide.BUY,
-                quantity=Quantity.from_int(1),
-            )
-        else:
-            order = self.strategy.order_factory.stop_market(
-                instrument_id=ETHUSDT_PERP_BINANCE.id,
-                order_side=OrderSide.SELL,
-                quantity=Quantity.from_int(1),
-                trigger_price=Price.from_str("10000"),
-            )
-
-        retryable_error = BinanceError(
-            status=400,
-            message={
-                "code": BinanceErrorCode.INVALID_TIMESTAMP.value,
-                "msg": "Timestamp outside recvWindow.",
-            },
-            headers={},
-        )
-        submit = AsyncMock(
-            side_effect=[retryable_error, retryable_error, retryable_error, None],
-        )
-        client._submit_order_method[order.order_type] = submit
-        generate_submitted = mocker.patch.object(client, "generate_order_submitted")
-        generate_rejected = mocker.patch.object(client, "generate_order_rejected")
-
-        await client._submit_order_inner(order, position_side=None)
-
-        assert client._submit_retry_manager_pool.max_retries == 3
-        assert submit.await_count == 4
-        generate_submitted.assert_called_once()
-        generate_rejected.assert_not_called()
-
-    @pytest.mark.asyncio
     async def test_submit_default_none_does_not_retry_ambiguous_error(self, mocker):
-        client = self._exec_client_with_default_submit_retries()
+        client = self._exec_client_with_default_submit_policy()
         order = self.strategy.order_factory.market(
             instrument_id=ETHUSDT_PERP_BINANCE.id,
             order_side=OrderSide.BUY,
@@ -442,7 +398,7 @@ class TestBinanceFuturesExecutionClient:
 
         await client._submit_order_inner(order, position_side=None)
 
-        assert client._submit_retry_manager_pool.max_retries == 3
+        assert client._submit_retry_manager_pool.max_retries == 0
         submit.assert_awaited_once()
         generate_submitted.assert_called_once()
         generate_rejected.assert_not_called()

@@ -309,7 +309,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         )
         self._submit_retry_manager_pool = RetryManagerPool[None](
             pool_size=100,
-            max_retries=self._max_retries,
+            max_retries=config.max_retries or 0,
             delay_initial_ms=config.retry_delay_initial_ms or 1_000,
             delay_max_ms=config.retry_delay_max_ms or 10_000,
             backoff_factor=2,
