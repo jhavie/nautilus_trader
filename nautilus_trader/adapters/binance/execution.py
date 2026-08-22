@@ -17,6 +17,7 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
 from decimal import Decimal
+from typing import Final
 
 from nautilus_trader.adapters.binance.common.constants import BINANCE_FUTURES_ALGO_ORDER_TYPES
 from nautilus_trader.adapters.binance.common.constants import BINANCE_MAX_CALLBACK_RATE
@@ -44,7 +45,9 @@ from nautilus_trader.adapters.binance.http.account import BinanceAccountHttpAPI
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.adapters.binance.http.error import BinanceError
 from nautilus_trader.adapters.binance.http.error import get_binance_error_code
+from nautilus_trader.adapters.binance.http.error import is_ambiguous_submit_error
 from nautilus_trader.adapters.binance.http.error import should_retry
+from nautilus_trader.adapters.binance.http.error import should_retry_submit_order
 from nautilus_trader.adapters.binance.http.market import BinanceMarketHttpAPI
 from nautilus_trader.adapters.binance.websocket.user import BinanceUserDataWebSocketClient
 from nautilus_trader.cache.cache import Cache
@@ -99,6 +102,11 @@ from nautilus_trader.model.orders import StopLimitOrder
 from nautilus_trader.model.orders import StopMarketOrder
 from nautilus_trader.model.orders import TrailingStopMarketOrder
 from nautilus_trader.model.position import Position
+
+
+BINANCE_UNKNOWN_SUBMIT_RETRY_SAFE: Final[bool] = True
+BINANCE_CLIENT_ORDER_ID_REPLAY_GUARD: Final[bool] = True
+BINANCE_CLIENT_ORDER_ID_REPLAY_GUARD_VISIBILITY_MARGIN_MS: Final[int] = 1_000
 
 
 class BinanceCommonExecutionClient(LiveExecutionClient):
@@ -189,6 +197,8 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         )
         self._recv_window = config.recv_window_ms
         self._max_retries = config.max_retries or 3
+        self._client_order_id_replay_guard_started_ms = self._clock.timestamp_ms()
+        self._client_order_id_replay_guard_attempted: set[ClientOrderId] = set()
         self._log.info(f"Account type: {self._binance_account_type.value}", LogColor.BLUE)
         self._log.info(f"{config.use_gtd=}", LogColor.BLUE)
         self._log.info(f"{config.use_reduce_only=}", LogColor.BLUE)
@@ -297,6 +307,17 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             retry_check=should_retry,
             error_logger=self._log_retry_error,
         )
+        self._submit_retry_manager_pool = RetryManagerPool[None](
+            pool_size=100,
+            max_retries=self._max_retries,
+            delay_initial_ms=config.retry_delay_initial_ms or 1_000,
+            delay_max_ms=config.retry_delay_max_ms or 10_000,
+            backoff_factor=2,
+            logger=self._log,
+            exc_types=(BinanceError,),
+            retry_check=should_retry_submit_order,
+            error_logger=self._log_retry_error,
+        )
 
         self._log.info(f"Base url HTTP {self._http_client.base_url}", LogColor.BLUE)
         self._log.info(f"Base url WebSocket {ws_api_url}", LogColor.BLUE)
@@ -328,6 +349,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
 
     def _stop(self) -> None:
         self._retry_manager_pool.shutdown()
+        self._submit_retry_manager_pool.shutdown()
 
     def _log_retry_error(self, message: str, exception: BaseException | None) -> None:
         error_code = get_binance_error_code(exception) if exception else None
@@ -817,6 +839,17 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             self._deny_order_pre_submit(order, validation_error)
             return
 
+        replay_guard_requested = (
+            params is not None and params.get("client_order_id_replay_guard") is True
+        )
+        if replay_guard_requested and not self._is_standard_futures_order(order):
+            self._deny_order_pre_submit(
+                order,
+                "UNSUPPORTED_CLIENT_ORDER_ID_REPLAY_GUARD: only standard Binance Futures "
+                "MARKET and LIMIT orders are supported",
+            )
+            return
+
         self._log.debug(f"Submitting {order}, position_side={position_side}")
 
         # Generate event here to ensure correct ordering of events
@@ -827,7 +860,19 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
-        retry_manager = await self._retry_manager_pool.acquire()
+        if replay_guard_requested:
+            if not await self._prepare_client_order_id_replay_guard(order):
+                return
+
+            await self._submit_order_once_with_replay_guard(
+                order,
+                position_side,
+                price_match,
+                close_position,
+            )
+            return
+
+        retry_manager = await self._submit_retry_manager_pool.acquire()
         try:
             await retry_manager.run(
                 "submit_order",
@@ -840,9 +885,16 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             )
 
             if not retry_manager.result:
+                last_exc = retry_manager.last_exception
+                if retry_manager.message == "Canceled retry" or is_ambiguous_submit_error(last_exc):
+                    self._log.warning(
+                        f"Ambiguous submit failure for {order.client_order_id!r}; "
+                        "awaiting in-flight reconciliation",
+                    )
+                    return
+
                 # Determine if the rejection was specifically due to a POST-ONLY order
                 # that would have executed immediately as a taker (GTX_ORDER_REJECT -5022).
-                last_exc = retry_manager.last_exception
                 due_post_only = (
                     _is_post_only_rejection(last_exc)
                     if isinstance(last_exc, BinanceError)
@@ -858,7 +910,182 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                     due_post_only=due_post_only,
                 )
         finally:
-            await self._retry_manager_pool.release(retry_manager)
+            await self._submit_retry_manager_pool.release(retry_manager)
+
+    def _is_standard_futures_order(self, order: Order) -> bool:
+        return self._binance_account_type.is_futures and order.order_type in {
+            OrderType.MARKET,
+            OrderType.LIMIT,
+        }
+
+    async def _prepare_client_order_id_replay_guard(self, order: Order) -> bool:
+        """
+        Return whether one standard Futures submit POST may be attempted.
+
+        This opt-in guard is an operational at-most-once aid, not a formal exactly-once
+        guarantee. It depends on Binance retaining and exposing an order by its exact client
+        order ID within the startup visibility fence.
+
+        """
+        query_known, found = await self._query_client_order_id_for_replay_guard(order)
+        if not query_known:
+            return False
+        if found is not None:
+            self._reconcile_client_order_id_replay_guard(order, found)
+            return False
+
+        if not await self._wait_for_client_order_id_replay_guard_fence(order.client_order_id):
+            return False
+
+        query_known, found = await self._query_client_order_id_for_replay_guard(order)
+        if not query_known:
+            return False
+        if found is not None:
+            self._reconcile_client_order_id_replay_guard(order, found)
+            return False
+
+        if order.client_order_id in self._client_order_id_replay_guard_attempted:
+            self._log.warning(
+                f"Replay-guarded submit already attempted for {order.client_order_id!r}; "
+                "not sending another POST",
+            )
+            return False
+
+        # There are no awaits between checking and recording the ID. This makes the transition
+        # atomic with respect to other coroutines on this event loop.
+        self._client_order_id_replay_guard_attempted.add(order.client_order_id)
+        return True
+
+    async def _query_client_order_id_for_replay_guard(
+        self,
+        order: Order,
+    ) -> tuple[bool, BinanceOrder | None]:
+        try:
+            found = await self._http_account.query_order(
+                symbol=order.instrument_id.symbol.value,
+                orig_client_order_id=order.client_order_id.value,
+                recv_window=str(self._recv_window),
+            )
+        except asyncio.CancelledError:
+            self._log.warning(
+                f"Replay-guard query canceled for {order.client_order_id!r}; blocking submit",
+            )
+            return False, None
+        except BinanceError as e:
+            if _is_no_such_order(e):
+                return True, None
+
+            self._log.warning(
+                f"Replay-guard query was inconclusive for {order.client_order_id!r}: "
+                f"{e.message}; blocking submit",
+            )
+            return False, None
+        except Exception as e:
+            self._log.warning(
+                f"Replay-guard query failed for {order.client_order_id!r}: {e}; blocking submit",
+            )
+            return False, None
+
+        if found is None or found.clientOrderId != order.client_order_id.value:
+            self._log.warning(
+                f"Replay-guard query returned an invalid result for {order.client_order_id!r}; "
+                "blocking submit",
+            )
+            return False, None
+
+        return True, found
+
+    async def _wait_for_client_order_id_replay_guard_fence(
+        self,
+        client_order_id: ClientOrderId,
+    ) -> bool:
+        fence_ms = (
+            self._client_order_id_replay_guard_started_ms
+            + self._recv_window
+            + BINANCE_CLIENT_ORDER_ID_REPLAY_GUARD_VISIBILITY_MARGIN_MS
+        )
+        wait_ms = fence_ms - self._clock.timestamp_ms()
+        if wait_ms <= 0:
+            return True
+
+        self._log.info(
+            f"Waiting {wait_ms} ms for replay-guard visibility fence for {client_order_id!r}",
+        )
+        try:
+            await asyncio.sleep(wait_ms / 1_000)
+        except asyncio.CancelledError:
+            self._log.warning(
+                f"Replay-guard visibility fence canceled for {client_order_id!r}; blocking submit",
+            )
+            return False
+
+        return True
+
+    def _reconcile_client_order_id_replay_guard(
+        self,
+        order: Order,
+        found: BinanceOrder,
+    ) -> None:
+        try:
+            report = found.parse_to_order_status_report(
+                account_id=self.account_id,
+                instrument_id=order.instrument_id,
+                report_id=UUID4(),
+                enum_parser=self._enum_parser,
+                treat_expired_as_canceled=self._treat_expired_as_canceled,
+                ts_init=self._clock.timestamp_ns(),
+            )
+        except Exception as e:
+            self._log.warning(
+                f"Could not reconcile replay-guard result for {order.client_order_id!r}: {e}",
+            )
+            return
+
+        self._log.info(
+            f"Replay guard found existing order {order.client_order_id!r}; reconciling without POST",
+        )
+        self._send_order_status_report(report)
+
+    async def _submit_order_once_with_replay_guard(
+        self,
+        order: Order,
+        position_side: BinanceFuturesPositionSide | None,
+        price_match: str | None,
+        close_position: bool,
+    ) -> None:
+        try:
+            await self._submit_order_method[order.order_type](
+                order,
+                position_side,
+                price_match,
+                close_position,
+            )
+        except asyncio.CancelledError:
+            self._log.warning(
+                f"Replay-guarded submit canceled for {order.client_order_id!r}; "
+                "awaiting in-flight reconciliation",
+            )
+        except BinanceError as e:
+            if is_ambiguous_submit_error(e):
+                self._log.warning(
+                    f"Ambiguous replay-guarded submit failure for {order.client_order_id!r}; "
+                    "awaiting in-flight reconciliation",
+                )
+                return
+
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=str(e.message),
+                ts_event=self._clock.timestamp_ns(),
+                due_post_only=_is_post_only_rejection(e),
+            )
+        except Exception as e:
+            self._log.warning(
+                f"Unexpected replay-guarded submit failure for {order.client_order_id!r}: {e}; "
+                "awaiting in-flight reconciliation",
+            )
 
     def _extract_price_match(
         self,

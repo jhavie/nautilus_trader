@@ -16,7 +16,10 @@
 import pytest
 
 from nautilus_trader.adapters.binance.http.error import BinanceError
+from nautilus_trader.adapters.binance.http.error import BinanceServerError
+from nautilus_trader.adapters.binance.http.error import is_ambiguous_submit_error
 from nautilus_trader.adapters.binance.http.error import should_retry
+from nautilus_trader.adapters.binance.http.error import should_retry_submit_order
 
 
 @pytest.fixture
@@ -154,3 +157,53 @@ def test_should_retry_with_invalid_code_type():
     result = should_retry(error)
     # Should not crash on invalid int conversion
     assert result is False
+
+
+@pytest.mark.parametrize("error_code", [-1006, -1007])
+def test_unknown_execution_status_is_not_retryable_for_submit(error_code):
+    error = BinanceError(
+        status=504,
+        message={"code": error_code, "msg": "Execution status unknown."},
+        headers={},
+    )
+
+    assert is_ambiguous_submit_error(error)
+    assert should_retry_submit_order(error) is False
+
+
+def test_definitive_retry_error_remains_retryable_for_submit():
+    error = BinanceError(
+        status=400,
+        message={"code": -1021, "msg": "Timestamp outside recvWindow."},
+        headers={},
+    )
+
+    assert not is_ambiguous_submit_error(error)
+    assert should_retry_submit_order(error) is True
+
+
+def test_timeout_remains_retryable_for_non_submit_operations():
+    error = BinanceError(
+        status=504,
+        message={"code": -1007, "msg": "Execution status unknown."},
+        headers={},
+    )
+
+    assert should_retry(error) is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BinanceServerError(status=200, message="Non-JSON response", headers={}),
+        BinanceServerError(status=500, message="Internal server error", headers={}),
+        BinanceError(
+            status=503,
+            message={"code": -1003, "msg": "Service unavailable"},
+            headers={},
+        ),
+    ],
+)
+def test_http_5xx_is_ambiguous_and_not_retryable_for_submit(error):
+    assert is_ambiguous_submit_error(error)
+    assert should_retry_submit_order(error) is False
