@@ -5962,6 +5962,7 @@ impl OKXHttpClient {
         callback_ratio: Option<String>,
         callback_spread: Option<String>,
         activation_price: Option<Price>,
+        sl_trigger: bool,
     ) -> Result<OKXPlaceAlgoOrderResponse, OKXHttpError> {
         if !matches!(order_side, OrderSide::Buy | OrderSide::Sell) {
             return Err(OKXHttpError::ValidationError(
@@ -6058,6 +6059,43 @@ impl OKXHttpClient {
                 tp_trigger_px_type,
                 Some(OKXPositionSide::Net),
                 Some(true),
+            )
+        } else if sl_trigger {
+            if !matches!(order_type, OrderType::StopMarket | OrderType::StopLimit) {
+                return Err(OKXHttpError::ValidationError(format!(
+                    "OKX sl_trigger is only supported for stop orders, received {order_type:?}",
+                )));
+            }
+
+            let sl_trigger_px = trigger_price.map(|p| p.to_string()).ok_or_else(|| {
+                OKXHttpError::ValidationError(
+                    "OKX sl_trigger orders require trigger_price".to_string(),
+                )
+            })?;
+            let sl_order_px = if order_type == OrderType::StopLimit {
+                limit_price.map(|p| p.to_string()).ok_or_else(|| {
+                    OKXHttpError::ValidationError(
+                        "OKX StopLimit sl_trigger orders require limit_price".to_string(),
+                    )
+                })?
+            } else {
+                "-1".to_string()
+            };
+
+            (
+                OKXAlgoOrderType::Conditional,
+                Some(quantity.to_string()),
+                None,
+                None,
+                None,
+                Some(sl_trigger_px),
+                Some(sl_order_px),
+                Some(trigger_px_type_enum),
+                None,
+                None,
+                None,
+                Some(OKXPositionSide::Net),
+                reduce_only,
             )
         } else {
             let algo_type = conditional_order_to_algo_type(order_type)

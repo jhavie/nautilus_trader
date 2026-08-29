@@ -1670,6 +1670,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
         td_mode = self._get_trade_mode_for_order(order.instrument_id, command.params)
         close_fraction = self._normalize_close_fraction(command)
+        sl_trigger = self._parse_sl_trigger_param(command.params)
         reduce_only = True if close_fraction is not None else (order.is_reduce_only or None)
 
         try:
@@ -1698,6 +1699,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 callback_ratio=callback_ratio,
                 callback_spread=callback_spread,
                 activation_price=pyo3_activation_price,
+                sl_trigger=sl_trigger,
             )
 
             if response.get("s_code") and response["s_code"] != "0":

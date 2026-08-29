@@ -1141,6 +1141,7 @@ impl OKXHttpClient {
         callback_ratio=None,
         callback_spread=None,
         activation_price=None,
+        sl_trigger=false,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_place_algo_order<'py>(
@@ -1162,6 +1163,7 @@ impl OKXHttpClient {
         callback_ratio: Option<String>,
         callback_spread: Option<String>,
         activation_price: Option<Price>,
+        sl_trigger: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -1185,6 +1187,7 @@ impl OKXHttpClient {
                     callback_ratio,
                     callback_spread,
                     activation_price,
+                    sl_trigger,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;

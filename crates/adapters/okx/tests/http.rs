@@ -4126,6 +4126,7 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -4147,6 +4148,73 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
     assert_eq!(body["slOrdPx"], "-1");
     assert_eq!(body["slTriggerPxType"], "last");
     assert!(body.get("sz").is_none());
+    assert!(body.get("triggerPx").is_none());
+    assert!(body.get("orderPx").is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_place_algo_order_with_sl_trigger_uses_exact_size_conditional_payload() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    let response = client
+        .place_algo_order_with_domain_types(
+            InstrumentId::from("SOL-USDT-SWAP.OKX"),
+            OKXTradeMode::Cross,
+            ClientOrderId::from("O-partial-sl"),
+            OrderSide::Buy,
+            OrderType::StopMarket,
+            Quantity::from("184.24"),
+            Some(Price::from("104.90")),
+            Some(TriggerType::MarkPrice),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.algo_id, "12345");
+
+    let body = state
+        .last_algo_order_body
+        .lock()
+        .await
+        .clone()
+        .expect("expected algo order payload");
+
+    assert_eq!(body["ordType"], "conditional");
+    assert_eq!(body["sz"], "184.24");
+    assert_eq!(body["reduceOnly"], true);
+    assert_eq!(body["posSide"], "net");
+    assert_eq!(body["slTriggerPx"], "104.90");
+    assert_eq!(body["slOrdPx"], "-1");
+    assert_eq!(body["slTriggerPxType"], "mark");
+    assert!(body.get("closeFraction").is_none());
     assert!(body.get("triggerPx").is_none());
     assert!(body.get("orderPx").is_none());
 }
@@ -6352,6 +6420,7 @@ async fn test_http_place_algo_order_returns_error_on_nonzero_scode() {
             None,
             None,
             None,
+            false,
         )
         .await;
 

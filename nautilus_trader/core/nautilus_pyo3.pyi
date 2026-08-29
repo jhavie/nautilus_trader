@@ -8809,6 +8809,7 @@ class OKXHttpClient:
         callback_ratio: str | None = None,
         callback_spread: str | None = None,
         activation_price: Price | None = None,
+        sl_trigger: bool = False,
     ) -> Any: ...
     async def cancel_algo_order(
         self,

@@ -524,6 +524,7 @@ impl OKXExecutionClient {
         let activation_price = order.activation_price();
 
         let close_fraction = get_param_as_string(&cmd.params, "close_fraction");
+        let sl_trigger = get_param_as_bool(&cmd.params, "sl_trigger").unwrap_or(false);
         let reduce_only = if close_fraction.is_some() {
             Some(true)
         } else {
@@ -569,6 +570,7 @@ impl OKXExecutionClient {
                     callback_ratio,
                     callback_spread,
                     activation_price,
+                    sl_trigger,
                 )
                 .await;
 

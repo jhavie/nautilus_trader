@@ -1,3 +1,20 @@
+# NautilusTrader 1.231.2 Fork
+
+Released on 29th August 2026 (UTC).
+
+Fork patch release based on `v1.231.1`, preserving its OKX algo-order, cache
+restoration, and live reconciliation protections.
+
+### Fork Fixes
+- Route explicitly flagged, exact-size reduce-only stop orders through the OKX
+  conditional stop-loss fields (`sz`, `slTriggerPx`, and `slOrdPx`) instead of
+  the generic trigger-order fields rejected by OKX.
+- Preserve the existing close-fraction full-position stop and conditional-stop
+  amend paths while exposing the new `sl_trigger` selector consistently across
+  Rust, PyO3, Python, and type stubs.
+
+---
+
 # NautilusTrader 1.231.1 Fork
 
 Released on 7th August 2026 (UTC).

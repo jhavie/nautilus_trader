@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -62,6 +63,14 @@ from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 from tests.integration_tests.adapters.okx.conftest import _create_ws_mock
+
+
+def test_okx_http_algo_order_signature_appends_sl_trigger_for_positional_compatibility():
+    parameters = list(
+        inspect.signature(nautilus_pyo3.OKXHttpClient.place_algo_order).parameters,
+    )
+
+    assert parameters[-1] == "sl_trigger"
 
 
 @pytest.fixture
@@ -2137,6 +2146,54 @@ async def test_submit_close_fraction_algo_order_forwards_param(
     call = http_client.place_algo_order.await_args
     assert call is not None
     assert call.kwargs["close_fraction"] == "1"
+    assert call.kwargs["reduce_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_submit_sl_trigger_algo_order_forwards_param(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    http_client.place_algo_order = AsyncMock(return_value={"algo_id": "algo-123", "s_code": "0"})
+
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-partial-sl"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("0.005000"),
+        trigger_price=Price.from_str("40000.00"),
+        trigger_type=TriggerType.MARK_PRICE,
+        time_in_force=TimeInForce.GTC,
+        expire_time_ns=0,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+        reduce_only=True,
+    )
+    command = SubmitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order=order,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params={"sl_trigger": True},
+    )
+
+    await client._submit_order(command)
+
+    http_client.place_algo_order.assert_awaited_once()
+    call = http_client.place_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["sl_trigger"] is True
+    assert call.kwargs["close_fraction"] is None
     assert call.kwargs["reduce_only"] is True
 
 
