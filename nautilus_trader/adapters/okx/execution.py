@@ -1353,6 +1353,17 @@ class OKXExecutionClient(LiveExecutionClient):
             f"OKX close_fraction must be a str, int, or float, was {type(close_fraction).__name__}",
         )
 
+    @staticmethod
+    def _normalize_sl_trigger(params: dict[str, object] | None) -> bool:
+        sl_trigger = params.get("sl_trigger") if params else None
+        if sl_trigger is None:
+            return False
+        if isinstance(sl_trigger, bool):
+            return sl_trigger
+        raise ValueError(
+            f"OKX sl_trigger must be a bool, was {type(sl_trigger).__name__}",
+        )
+
     def _extract_attached_bracket_orders(
         self,
         orders: list[Order],
@@ -1640,6 +1651,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
         td_mode = self._get_trade_mode_for_order(order.instrument_id, command.params)
         close_fraction = self._normalize_close_fraction(command)
+        sl_trigger = self._normalize_sl_trigger(command.params)
         reduce_only = True if close_fraction is not None else (order.is_reduce_only or None)
 
         try:
@@ -1665,6 +1677,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 limit_price=pyo3_limit_price,
                 reduce_only=reduce_only,
                 close_fraction=close_fraction,
+                sl_trigger=sl_trigger,
                 callback_ratio=callback_ratio,
                 callback_spread=callback_spread,
                 activation_price=pyo3_activation_price,
@@ -1880,6 +1893,7 @@ class OKXExecutionClient(LiveExecutionClient):
         new_quantity = (
             nautilus_pyo3.Quantity.from_str(str(command.quantity)) if command.quantity else None
         )
+        sl_trigger = self._normalize_sl_trigger(command.params)
 
         self._log.debug(
             f"Amending OKX algo order using algo_id {algo_id} for {command.client_order_id!r}",
@@ -1892,6 +1906,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 new_trigger_price=new_trigger_price,
                 new_limit_price=new_limit_price,
                 new_quantity=new_quantity,
+                sl_trigger=sl_trigger,
             )
 
             s_code = resp.get("s_code", "0")
