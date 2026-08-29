@@ -87,7 +87,7 @@ use nautilus_okx::{
         },
         enums::{OKXWsChannel, OKXWsOperation},
         messages::{ExecutionReport, OKXOrderMsg, OKXWsFrame, OKXWsMessage},
-        parse::OrderStateSnapshot,
+        parse::{OrderStateSnapshot, parse_order_msg_vec},
     },
 };
 use rstest::rstest;
@@ -269,6 +269,113 @@ fn drain_events(
         events.push(e);
     }
     events
+}
+
+#[rstest]
+fn test_dispatch_terminal_triggered_child_reports_actual_quantity_before_final_fill() {
+    let parent_client_order_id = ClientOrderId::new("BSL-CLOSE-FRACTION");
+    let child_client_order_id = "O-TRIGGERED-CHILD";
+    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+    let child_venue_order_id = "3875941226260987904";
+    let message: OKXOrderMsg = serde_json::from_value(json!({
+        "accFillSz": "37.52",
+        "algoClOrdId": parent_client_order_id.as_str(),
+        "avgPx": "105.14",
+        "cTime": "1779648154000",
+        "category": "normal",
+        "ccy": "USDT",
+        "clOrdId": child_client_order_id,
+        "execType": "T",
+        "feeCcy": "USDT",
+        "fillPx": "105.14",
+        "fillSz": "7.52",
+        "fillTime": "1779648155000",
+        "instId": "ETH-USDT-SWAP",
+        "instType": "SWAP",
+        "lever": "1",
+        "ordId": child_venue_order_id,
+        "ordType": "market",
+        "pnl": "0",
+        "posSide": "net",
+        "px": "-1",
+        "reduceOnly": "true",
+        "side": "sell",
+        "state": "filled",
+        "sz": "37.52",
+        "tdMode": "cross",
+        "tradeId": "terminal-child-fill",
+        "uTime": "1779648155000"
+    }))
+    .unwrap();
+
+    let (emitter, mut rx) = test_emitter();
+    let state = state_with_order_identity(parent_client_order_id, instrument_id);
+    let instruments = AtomicMap::new();
+    instruments.insert(
+        Ustr::from("ETH-USDT-SWAP"),
+        order_instrument(OKXInstrumentType::Swap, instrument_id, "ETH-USDT-SWAP"),
+    );
+    let mut fee_cache = AHashMap::new();
+    let mut filled_qty_cache = AHashMap::new();
+    filled_qty_cache.insert(Ustr::from(child_venue_order_id), Quantity::from("30"));
+    let mut order_state_cache = AHashMap::new();
+
+    let mut report_instruments = AHashMap::new();
+    report_instruments.insert(
+        Ustr::from("ETH-USDT-SWAP"),
+        order_instrument(OKXInstrumentType::Swap, instrument_id, "ETH-USDT-SWAP"),
+    );
+    let mut report_fee_cache = AHashMap::new();
+    let mut report_filled_qty_cache = AHashMap::new();
+    report_filled_qty_cache.insert(Ustr::from(child_venue_order_id), Quantity::from("30"));
+    let reports = parse_order_msg_vec(
+        std::slice::from_ref(&message),
+        AccountId::from("OKX-001"),
+        &report_instruments,
+        &mut report_fee_cache,
+        &mut report_filled_qty_cache,
+        UnixNanos::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        reports.as_slice(),
+        [ExecutionReport::Order(_), ExecutionReport::Fill(_)]
+    ));
+
+    dispatch_ws_message(
+        OKXWsMessage::Orders(vec![message]),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+
+    let events = drain_events(&mut rx);
+    assert_eq!(
+        events.len(),
+        3,
+        "expected accepted, terminal quantity report, then fill"
+    );
+    match (&events[0], &events[1], &events[2]) {
+        (
+            ExecutionEvent::Order(OrderEventAny::Accepted(accepted)),
+            ExecutionEvent::Report(CommonExecutionReport::Order(report)),
+            ExecutionEvent::Order(OrderEventAny::Filled(filled)),
+        ) => {
+            assert_eq!(accepted.client_order_id, parent_client_order_id);
+            assert_eq!(report.client_order_id, Some(parent_client_order_id));
+            assert_eq!(report.order_status, OrderStatus::Filled);
+            assert_eq!(report.quantity, Quantity::from("37.52"));
+            assert_eq!(report.filled_qty, Quantity::from("37.52"));
+            assert_eq!(filled.client_order_id, parent_client_order_id);
+            assert_eq!(filled.last_qty, Quantity::from("7.52"));
+        }
+        other => panic!("Expected accepted, terminal quantity report, then fill, was {other:?}"),
+    }
 }
 
 #[rstest]

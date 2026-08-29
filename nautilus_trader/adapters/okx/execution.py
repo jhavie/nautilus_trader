@@ -79,6 +79,7 @@ from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
 from nautilus_trader.model.instruments import CryptoOptionSpread
@@ -209,6 +210,10 @@ class OKXExecutionClient(LiveExecutionClient):
         self._client_id_aliases: dict[ClientOrderId, ClientOrderId] = {}
         self._client_id_children: dict[ClientOrderId, ClientOrderId] = {}
         self._attached_oco_bindings: dict[ClientOrderId, OKXAttachedOcoBinding] = {}
+        self._terminal_child_resizes: dict[
+            ClientOrderId,
+            tuple[Quantity, VenueOrderId],
+        ] = {}
 
         # WebSocket API
         _private_url = config.base_url_ws or nautilus_pyo3.get_okx_ws_url_private(
@@ -3048,6 +3053,37 @@ class OKXExecutionClient(LiveExecutionClient):
                     ts_event=report.ts_last,
                 )
         elif report.order_status == OrderStatus.FILLED:
+            reported_quantity = Decimal(str(report.quantity))
+            reported_filled_quantity = Decimal(str(report.filled_qty))
+            current_quantity = Decimal(str(order.quantity))
+            current_filled_quantity = Decimal(str(order.filled_qty))
+            if (
+                self._is_conditional_order(order)
+                and report.venue_order_id is not None
+                and reported_quantity > 0
+                and reported_quantity == reported_filled_quantity
+                and reported_quantity >= current_filled_quantity
+                and reported_quantity != current_quantity
+            ):
+                venue_order_id_modified = (
+                    order.venue_order_id is not None
+                    and order.venue_order_id != report.venue_order_id
+                )
+                self.generate_order_updated(
+                    strategy_id=order.strategy_id,
+                    instrument_id=report.instrument_id,
+                    client_order_id=report.client_order_id,
+                    venue_order_id=report.venue_order_id,
+                    quantity=report.quantity,
+                    price=order.price if order.has_price else None,
+                    trigger_price=order.trigger_price if order.has_trigger_price else None,
+                    ts_event=report.ts_last,
+                    venue_order_id_modified=venue_order_id_modified,
+                )
+                self._terminal_child_resizes[order.client_order_id] = (
+                    report.quantity,
+                    report.venue_order_id,
+                )
             self._clear_client_order_aliases(report)
         else:
             self._log.warning(f"Received unhandled OrderStatusReport: {report}")
@@ -3086,6 +3122,12 @@ class OKXExecutionClient(LiveExecutionClient):
             return
 
         net_last_qty = report.last_qty
+        terminal_child_resize = self._terminal_child_resizes.pop(order.client_order_id, None)
+        terminal_child_resize_matches = bool(
+            terminal_child_resize is not None
+            and report.venue_order_id is not None
+            and terminal_child_resize[1] == report.venue_order_id
+        )
 
         # For SPOT margin MARKET BUY orders, adjust ALL fills for commission
         # Commission is deducted from the base currency
@@ -3136,17 +3178,18 @@ class OKXExecutionClient(LiveExecutionClient):
                 venue_order_id=report.venue_order_id,
                 overwrite=True,
             )
-            self.generate_order_updated(
-                strategy_id=order.strategy_id,
-                instrument_id=order.instrument_id,
-                client_order_id=order.client_order_id,
-                venue_order_id=report.venue_order_id,
-                quantity=order.quantity,
-                price=order.price if order.has_price else None,
-                trigger_price=order.trigger_price if order.has_trigger_price else None,
-                ts_event=report.ts_event,
-                venue_order_id_modified=True,
-            )
+            if not terminal_child_resize_matches:
+                self.generate_order_updated(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=report.venue_order_id,
+                    quantity=order.quantity,
+                    price=order.price if order.has_price else None,
+                    trigger_price=order.trigger_price if order.has_trigger_price else None,
+                    ts_event=report.ts_event,
+                    venue_order_id_modified=True,
+                )
 
         self.generate_order_filled(
             strategy_id=order.strategy_id,
@@ -3311,6 +3354,8 @@ class OKXExecutionClient(LiveExecutionClient):
 
     def _clear_order_state(self, client_order_id: ClientOrderId) -> None:
         canonical = self._canonical_client_order_id(client_order_id) or client_order_id
+        self._terminal_child_resizes.pop(client_order_id, None)
+        self._terminal_child_resizes.pop(canonical, None)
         self._clear_attached_oco_binding(client_order_id)
         self._algo_order_ids.pop(canonical, None)
         self._algo_order_instruments.pop(canonical, None)

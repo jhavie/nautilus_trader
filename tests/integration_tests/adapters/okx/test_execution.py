@@ -2262,6 +2262,91 @@ async def test_handle_close_fraction_algo_accept_report_uses_cached_order_quanti
 
 
 @pytest.mark.asyncio
+async def test_terminal_conditional_child_report_resizes_parent_before_final_fill(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    client._set_connected(True)
+
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-close-fraction-terminal"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("75.040000"),
+        trigger_price=Price.from_str("105.14"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        expire_time_ns=0,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order=order))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order=order,
+            venue_order_id=VenueOrderId("algo-close-frac-terminal"),
+        ),
+    )
+    client._cache.add_order(order, None, None)
+
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", captured.append)
+
+    pyo3_report = nautilus_pyo3.OrderStatusReport(
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId("triggered-child-terminal"),
+        client_order_id=nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+        order_side=nautilus_pyo3.OrderSide.SELL,
+        order_type=nautilus_pyo3.OrderType.MARKET,
+        time_in_force=nautilus_pyo3.TimeInForce.GTC,
+        order_status=nautilus_pyo3.OrderStatus.FILLED,
+        quantity=nautilus_pyo3.Quantity.from_str("37.520000"),
+        filled_qty=nautilus_pyo3.Quantity.from_str("37.520000"),
+        reduce_only=True,
+        ts_accepted=0,
+        ts_last=1,
+        report_id=nautilus_pyo3.UUID4(),
+        ts_init=1,
+    )
+
+    client._handle_order_status_report_pyo3(pyo3_report)
+    client._handle_fill_report_pyo3(
+        nautilus_pyo3.FillReport(
+            account_id=nautilus_pyo3.AccountId(client.account_id.value),
+            instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+            venue_order_id=nautilus_pyo3.VenueOrderId("triggered-child-terminal"),
+            trade_id=nautilus_pyo3.TradeId("terminal-child-final-fill"),
+            order_side=nautilus_pyo3.OrderSide.SELL,
+            last_qty=nautilus_pyo3.Quantity.from_str("7.520000"),
+            last_px=nautilus_pyo3.Price.from_str("105.14"),
+            commission=nautilus_pyo3.Money.from_str("0 USD"),
+            liquidity_side=nautilus_pyo3.LiquiditySide.TAKER,
+            ts_event=2,
+            ts_init=2,
+            client_order_id=nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+        )
+    )
+
+    updates = [event for event in captured if isinstance(event, OrderUpdated)]
+    fills = [event for event in captured if isinstance(event, OrderFilled)]
+    assert len(updates) == 1
+    assert updates[0].quantity == Quantity.from_str("37.520000")
+    assert updates[0].venue_order_id == VenueOrderId("triggered-child-terminal")
+    assert len(fills) == 1
+    assert fills[0].last_qty == Quantity.from_str("7.520000")
+
+
+@pytest.mark.asyncio
 async def test_spot_margin_market_buy_denies_order_without_quote_quantity(
     exec_client_builder,
     monkeypatch,

@@ -64,7 +64,7 @@ use crate::{
         parse::{
             OrderStateSnapshot, ParsedOrderEvent, parse_algo_order_msg, parse_order_event,
             parse_order_msg, parse_spread_order_event, parse_spread_order_msg,
-            update_fee_fill_caches,
+            parse_terminal_triggered_child_status_report, update_fee_fill_caches,
         },
     },
 };
@@ -667,6 +667,22 @@ fn dispatch_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
+                    if matches!(&event, ParsedOrderEvent::Fill(_))
+                        && let Some(report) = parse_terminal_triggered_child_status_report(
+                            msg, instrument, account_id, ts_init,
+                        )
+                    {
+                        ensure_accepted_emitted(
+                            client_order_id,
+                            account_id,
+                            VenueOrderId::new(msg.ord_id),
+                            &ident,
+                            emitter,
+                            state,
+                            ts_init,
+                        );
+                        emitter.send_order_status_report(report);
+                    }
                     update_order_caches(
                         msg,
                         instrument,
@@ -1085,6 +1101,17 @@ fn dispatch_order_msg_as_report(
         Ok(report) => {
             if let Some(instrument) = instruments.get(&msg.inst_id) {
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
+                let mut reports = Vec::with_capacity(2);
+                if matches!(&report, ExecutionReport::Fill(_))
+                    && let Some(status_report) = parse_terminal_triggered_child_status_report(
+                        msg, instrument, account_id, ts_init,
+                    )
+                {
+                    reports.push(ExecutionReport::Order(status_report));
+                }
+                reports.push(report);
+                dispatch_execution_reports(reports, emitter, state);
+                return;
             }
             dispatch_execution_reports(vec![report], emitter, state);
         }

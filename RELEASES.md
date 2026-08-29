@@ -1,3 +1,20 @@
+# NautilusTrader 1.231.3 Fork
+
+Released on 29th August 2026 (UTC).
+
+Fork patch release based on `v1.231.2`, preserving its OKX conditional-stop,
+cache restoration, and live reconciliation protections.
+
+### Fork Fixes
+- Emit a terminal status report for an OKX triggered conditional child before
+  its final fill so the cached parent adopts the venue's actual close quantity.
+- Preserve incremental fill delivery and only resize conditional parents when
+  the triggered child is terminal and reports a positive fully-filled quantity.
+- Prevent a close-fraction stop that filled the remaining venue position from
+  remaining locally `PARTIALLY_FILLED` and repeatedly rejecting cancellation.
+
+---
+
 # NautilusTrader 1.231.2 Fork
 
 Released on 29th August 2026 (UTC).

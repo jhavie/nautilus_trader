@@ -1283,7 +1283,17 @@ pub fn parse_order_msg_vec(
             filled_qty_cache,
             ts_init,
         ) {
-            Ok(report) => order_reports.push(report),
+            Ok(report) => {
+                if matches!(&report, ExecutionReport::Fill(_))
+                    && let Some(instrument) = instruments.get(&msg.inst_id)
+                    && let Some(status_report) = parse_terminal_triggered_child_status_report(
+                        msg, instrument, account_id, ts_init,
+                    )
+                {
+                    order_reports.push(ExecutionReport::Order(status_report));
+                }
+                order_reports.push(report);
+            }
             Err(e) => log::error!("Failed to parse execution report from message: {e}"),
         }
 
@@ -1293,6 +1303,37 @@ pub fn parse_order_msg_vec(
     }
 
     Ok(order_reports)
+}
+
+/// Parses a terminal triggered algo child status carrying the venue's actual close quantity.
+#[must_use]
+pub fn parse_terminal_triggered_child_status_report(
+    msg: &OKXOrderMsg,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+) -> Option<OrderStatusReport> {
+    if msg.state != OKXOrderStatus::Filled || msg.algo_cl_ord_id.is_none() {
+        return None;
+    }
+
+    match parse_order_status_report(msg, instrument, account_id, ts_init) {
+        Ok(report)
+            if report.quantity.is_positive()
+                && report.filled_qty.is_positive()
+                && report.quantity == report.filled_qty =>
+        {
+            Some(report)
+        }
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!(
+                "Failed to parse terminal triggered child status for ord_id={}: {error}",
+                msg.ord_id,
+            );
+            None
+        }
+    }
 }
 
 /// Updates fee and fill caches from a raw OKX order message.
