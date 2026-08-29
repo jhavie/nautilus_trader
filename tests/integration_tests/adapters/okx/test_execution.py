@@ -63,10 +63,10 @@ from tests.integration_tests.adapters.okx.conftest import _create_ws_mock
 
 def test_okx_http_algo_order_signatures_append_sl_trigger_for_positional_compatibility():
     place_parameters = list(
-        inspect.signature(nautilus_pyo3.OKXHttpClient.place_algo_order).parameters
+        inspect.signature(nautilus_pyo3.OKXHttpClient.place_algo_order).parameters,
     )
     amend_parameters = list(
-        inspect.signature(nautilus_pyo3.OKXHttpClient.amend_algo_order).parameters
+        inspect.signature(nautilus_pyo3.OKXHttpClient.amend_algo_order).parameters,
     )
 
     assert place_parameters[-1] == "sl_trigger"
