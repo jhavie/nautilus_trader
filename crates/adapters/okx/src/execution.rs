@@ -522,6 +522,7 @@ impl OKXExecutionClient {
         let activation_price = order.activation_price();
 
         let close_fraction = get_param_as_string(&cmd.params, "close_fraction");
+        let sl_trigger = get_param_as_bool(&cmd.params, "sl_trigger").unwrap_or(false);
         let reduce_only = if close_fraction.is_some() {
             Some(true)
         } else {
@@ -564,6 +565,7 @@ impl OKXExecutionClient {
                     price,
                     reduce_only,
                     close_fraction,
+                    sl_trigger,
                     callback_ratio,
                     callback_spread,
                     activation_price,
@@ -2449,6 +2451,13 @@ fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
                 .or_else(|| v.as_f64().map(|n| n.to_string()))
         })
     })
+}
+
+fn get_param_as_bool(params: &Option<Params>, key: &str) -> Option<bool> {
+    params
+        .as_ref()
+        .and_then(|values| values.get(key))
+        .and_then(serde_json::Value::as_bool)
 }
 
 fn supports_algo_orders(instrument_type: OKXInstrumentType) -> bool {

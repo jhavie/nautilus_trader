@@ -1401,6 +1401,12 @@ pub struct OKXAmendAlgoOrderRequest {
     /// New order price (for limit orders after trigger).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_order_px: Option<String>,
+    /// New stop-loss trigger price (for conditional stop-loss orders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_sl_trigger_px: Option<String>,
+    /// New stop-loss order price (for conditional stop-loss orders).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_sl_ord_px: Option<String>,
     /// New callback ratio for trailing stop (e.g., "0.01" for 1%).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_callback_ratio: Option<String>,
@@ -1665,6 +1671,8 @@ mod tests {
             new_sz: None,
             new_trigger_px: Some("3500".to_string()),
             new_order_px: Some("3490".to_string()),
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
             new_callback_ratio: None,
             new_callback_spread: None,
             new_active_px: None,
@@ -1682,6 +1690,30 @@ mod tests {
     }
 
     #[rstest]
+    fn test_amend_algo_order_stop_loss_serialization() {
+        let request = OKXAmendAlgoOrderRequest {
+            inst_id: "SOL-USDT-SWAP".to_string(),
+            algo_id: "3875323457940340736".to_string(),
+            algo_cl_ord_id: None,
+            new_sz: Some("184.24".to_string()),
+            new_trigger_px: None,
+            new_order_px: None,
+            new_sl_trigger_px: Some("105.22".to_string()),
+            new_sl_ord_px: Some("-1".to_string()),
+            new_callback_ratio: None,
+            new_callback_spread: None,
+            new_active_px: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"newSlTriggerPx\":\"105.22\""));
+        assert!(json.contains("\"newSlOrdPx\":\"-1\""));
+        assert!(!json.contains("newTriggerPx"));
+        assert!(!json.contains("newOrderPx"));
+    }
+
+    #[rstest]
     fn test_amend_algo_order_trailing_stop_serialization() {
         let request = OKXAmendAlgoOrderRequest {
             inst_id: "BTC-USDT-SWAP".to_string(),
@@ -1690,6 +1722,8 @@ mod tests {
             new_sz: Some("0.1".to_string()),
             new_trigger_px: None,
             new_order_px: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
             new_callback_ratio: Some("0.02".to_string()),
             new_callback_spread: None,
             new_active_px: Some("50000".to_string()),
@@ -1828,6 +1862,8 @@ mod tests {
             new_sz: None,
             new_trigger_px: None,
             new_order_px: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
             new_callback_ratio: None,
             new_callback_spread: Some("25.0".to_string()),
             new_active_px: Some("4000".to_string()),
@@ -1851,6 +1887,8 @@ mod tests {
             new_sz: Some("0.5".to_string()),
             new_trigger_px: None,
             new_order_px: None,
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
             new_callback_ratio: None,
             new_callback_spread: None,
             new_active_px: None,
@@ -1875,6 +1913,8 @@ mod tests {
             new_sz: Some("1.0".to_string()),
             new_trigger_px: Some("60000".to_string()),
             new_order_px: Some("59900".to_string()),
+            new_sl_trigger_px: None,
+            new_sl_ord_px: None,
             new_callback_ratio: Some("0.015".to_string()),
             new_callback_spread: Some("100".to_string()),
             new_active_px: Some("62000".to_string()),

@@ -96,6 +96,7 @@ struct TestServerState {
     last_cancel_spread_order_body: Arc<tokio::sync::Mutex<Option<Value>>>,
     last_cancel_all_spread_orders_body: Arc<tokio::sync::Mutex<Option<Value>>>,
     last_algo_order_body: Arc<tokio::sync::Mutex<Option<Value>>>,
+    last_amend_algo_order_body: Arc<tokio::sync::Mutex<Option<Value>>>,
 }
 
 /// Wait for the test server to be ready by polling a health endpoint.
@@ -334,7 +335,8 @@ fn create_router(state: Arc<TestServerState>) -> Router {
     let order_cancel_state = state.clone();
     let algo_pending_state = state.clone();
     let algo_history_state = state.clone();
-    let algo_order_state = state;
+    let algo_order_state = state.clone();
+    let amend_algo_order_state = state;
     Router::new()
         .route(
             "/api/v5/public/instruments",
@@ -965,6 +967,28 @@ fn create_router(state: Arc<TestServerState>) -> Router {
                 }
 
                 Json(load_test_data("http_cancel_algo_order_response.json")).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/trade/amend-algos",
+            post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let state = amend_algo_order_state.clone();
+                async move {
+                    if !has_auth_headers(&headers) {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({
+                                "code": "401",
+                                "msg": "Missing authentication headers",
+                                "data": [],
+                            })),
+                        )
+                            .into_response();
+                    }
+
+                    *state.last_amend_algo_order_body.lock().await = Some(payload);
+                    Json(load_test_data("http_place_algo_order_response.json")).into_response()
+                }
             }),
         )
         .route(
@@ -3773,6 +3797,7 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
             None,
             None,
             Some("1".to_string()),
+            false,
             None,
             None,
             None,
@@ -3799,6 +3824,231 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
     assert!(body.get("sz").is_none());
     assert!(body.get("triggerPx").is_none());
     assert!(body.get("orderPx").is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_place_algo_order_with_sl_trigger_uses_conditional_stop_payload() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    client
+        .place_algo_order_with_domain_types(
+            InstrumentId::from("SOL-USDT-SWAP.OKX"),
+            OKXTradeMode::Cross,
+            ClientOrderId::from("O-partial-sl"),
+            OrderSide::Buy,
+            OrderType::StopMarket,
+            Quantity::from("184.24"),
+            Some(Price::from("105.14")),
+            Some(TriggerType::MarkPrice),
+            None,
+            Some(true),
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state
+        .last_algo_order_body
+        .lock()
+        .await
+        .clone()
+        .expect("expected algo order payload");
+
+    assert_eq!(body["ordType"], "conditional");
+    assert_eq!(body["sz"], "184.24");
+    assert_eq!(body["reduceOnly"], true);
+    assert_eq!(body["posSide"], "net");
+    assert_eq!(body["slTriggerPx"], "105.14");
+    assert_eq!(body["slOrdPx"], "-1");
+    assert_eq!(body["slTriggerPxType"], "mark");
+    assert!(body.get("closeFraction").is_none());
+    assert!(body.get("triggerPx").is_none());
+    assert!(body.get("orderPx").is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_place_algo_order_without_sl_trigger_preserves_trigger_payload() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    client
+        .place_algo_order_with_domain_types(
+            InstrumentId::from("SOL-USDT-SWAP.OKX"),
+            OKXTradeMode::Cross,
+            ClientOrderId::from("O-generic-trigger"),
+            OrderSide::Buy,
+            OrderType::StopMarket,
+            Quantity::from("184.24"),
+            Some(Price::from("105.14")),
+            Some(TriggerType::MarkPrice),
+            None,
+            Some(true),
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state
+        .last_algo_order_body
+        .lock()
+        .await
+        .clone()
+        .expect("expected algo order payload");
+
+    assert_eq!(body["ordType"], "trigger");
+    assert_eq!(body["triggerPx"], "105.14");
+    assert_eq!(body["orderPx"], "-1");
+    assert_eq!(body["triggerPxType"], "mark");
+    assert!(body.get("slTriggerPx").is_none());
+    assert!(body.get("slOrdPx").is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_amend_algo_order_with_sl_trigger_preserves_existing_execution_price() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    client
+        .amend_algo_order_with_domain_types(
+            InstrumentId::from("SOL-USDT-SWAP.OKX"),
+            "3875323457940340736".to_string(),
+            Some(Price::from("105.22")),
+            None,
+            Some(Quantity::from("184.24")),
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state
+        .last_amend_algo_order_body
+        .lock()
+        .await
+        .clone()
+        .expect("expected amend algo order payload");
+
+    assert_eq!(body["newSz"], "184.24");
+    assert_eq!(body["newSlTriggerPx"], "105.22");
+    assert!(body.get("newSlOrdPx").is_none());
+    assert!(body.get("newTriggerPx").is_none());
+    assert!(body.get("newOrderPx").is_none());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_http_amend_algo_order_with_sl_trigger_supports_limit_only_change() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    client
+        .amend_algo_order_with_domain_types(
+            InstrumentId::from("SOL-USDT-SWAP.OKX"),
+            "3875323457940340736".to_string(),
+            None,
+            Some(Price::from("105.10")),
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state
+        .last_amend_algo_order_body
+        .lock()
+        .await
+        .clone()
+        .expect("expected amend algo order payload");
+
+    assert_eq!(body["newSlOrdPx"], "105.10");
+    assert!(body.get("newSlTriggerPx").is_none());
+    assert!(body.get("newTriggerPx").is_none());
+    assert!(body.get("newOrderPx").is_none());
 }
 
 #[rstest]
@@ -5359,6 +5609,7 @@ async fn test_http_place_algo_order_returns_error_on_nonzero_scode() {
             None,
             None,
             None,
+            false,
             None,
             None,
             None,

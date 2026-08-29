@@ -8718,6 +8718,7 @@ class OKXHttpClient:
         callback_ratio: str | None = None,
         callback_spread: str | None = None,
         activation_price: Price | None = None,
+        sl_trigger: bool = False,
     ) -> Any: ...
     async def cancel_algo_order(
         self,
@@ -8745,6 +8746,7 @@ class OKXHttpClient:
         new_callback_ratio: str | None = None,
         new_callback_spread: str | None = None,
         new_activation_price: Price | None = None,
+        sl_trigger: bool = False,
     ) -> Any: ...
     async def cancel_advance_algo_order(
         self,
