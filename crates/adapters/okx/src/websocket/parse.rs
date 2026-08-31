@@ -56,9 +56,9 @@ use crate::{
     common::{
         consts::{OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE},
         enums::{
-            OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXGreeksType, OKXInstrumentStatus,
-            OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType, OKXSide,
-            OKXTargetCurrency, OKXTriggerType,
+            OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXGreeksType,
+            OKXInstrumentStatus, OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
+            OKXSide, OKXTargetCurrency, OKXTriggerType,
         },
         models::OKXInstrument,
         parse::{
@@ -1566,14 +1566,13 @@ pub fn parse_algo_order_status_report(
 
     let status: OrderStatus = msg.state.into();
 
-    let quantity = parse_algo_order_quantity(msg, instrument)?;
-
     // For algo orders, actual_sz represents filled quantity (if any)
     let filled_qty = if msg.actual_sz.is_empty() || msg.actual_sz == "0" {
         Quantity::zero(instrument.size_precision())
     } else {
         parse_quantity(msg.actual_sz.as_str(), instrument.size_precision())?
     };
+    let quantity = parse_algo_order_quantity(msg, instrument, filled_qty)?;
 
     // Parse limit price if it exists (not -1)
     let price = if is_market_price(algo_fields.ord_px) {
@@ -1721,7 +1720,21 @@ fn parse_algo_order_fields(msg: &OKXAlgoOrderMsg) -> anyhow::Result<AlgoOrderFie
 fn parse_algo_order_quantity(
     msg: &OKXAlgoOrderMsg,
     instrument: &InstrumentAny,
+    filled_qty: Quantity,
 ) -> anyhow::Result<Quantity> {
+    // A close-fraction algo is sized by the position at trigger time. Once OKX marks it fully
+    // effective, `actual_sz` is the authoritative child-order size while `sz` may still contain
+    // the pre-pyramid quantity. Do not apply this to partial states where `actual_sz` is cumulative.
+    if !msg.close_fraction.is_empty()
+        && matches!(
+            msg.state,
+            OKXAlgoOrderStatus::Effective | OKXAlgoOrderStatus::Filled
+        )
+        && filled_qty.is_positive()
+    {
+        return Ok(filled_qty);
+    }
+
     if !msg.sz.is_empty() {
         return parse_quantity(msg.sz.as_str(), instrument.size_precision());
     }
@@ -6844,6 +6857,79 @@ mod tests {
         assert_eq!(report.price, None);
         assert_eq!(report.quantity, Quantity::zero(inst.size_precision()));
         assert!(report.reduce_only);
+    }
+
+    #[rstest]
+    #[case(OKXAlgoOrderStatus::Effective, OrderStatus::Triggered)]
+    #[case(OKXAlgoOrderStatus::Filled, OrderStatus::Filled)]
+    fn test_parse_terminal_close_fraction_uses_actual_size_over_stale_size(
+        #[case] algo_status: OKXAlgoOrderStatus,
+        #[case] order_status: OrderStatus,
+    ) {
+        let instrument = create_stub_instrument();
+        let inst = InstrumentAny::CryptoPerpetual(instrument);
+        let account_id = AccountId::new("OKX-001");
+
+        let mut msg = stub_algo_order_msg(OKXAlgoOrderType::Conditional);
+        msg.state = algo_status;
+        msg.sz = "52.94".to_string();
+        msg.actual_sz = "144.13".to_string();
+        msg.ord_id = "3880620000000000000".to_string();
+        msg.trigger_px = String::new();
+        msg.trigger_px_type = OKXTriggerType::None;
+        msg.ord_px = String::new();
+        msg.sl_trigger_px = "78144.5".to_string();
+        msg.sl_ord_px = "-1".to_string();
+        msg.sl_trigger_px_type = OKXTriggerType::Last;
+        msg.close_fraction = "1".to_string();
+        msg.reduce_only = "true".to_string();
+
+        let report =
+            parse_algo_order_status_report(&msg, &inst, account_id, UnixNanos::default()).unwrap();
+
+        assert_eq!(report.order_status, order_status);
+        assert_eq!(report.quantity, Quantity::from("144.13"));
+        assert_eq!(report.filled_qty, Quantity::from("144.13"));
+    }
+
+    #[rstest]
+    fn test_parse_live_close_fraction_does_not_treat_actual_size_as_order_size() {
+        let instrument = create_stub_instrument();
+        let inst = InstrumentAny::CryptoPerpetual(instrument);
+        let account_id = AccountId::new("OKX-001");
+
+        let mut msg = stub_algo_order_msg(OKXAlgoOrderType::Conditional);
+        msg.state = OKXAlgoOrderStatus::Live;
+        msg.sz = "52.94".to_string();
+        msg.actual_sz = "12.34".to_string();
+        msg.close_fraction = "1".to_string();
+
+        let report =
+            parse_algo_order_status_report(&msg, &inst, account_id, UnixNanos::default()).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert_eq!(report.quantity, Quantity::from("52.94"));
+        assert_eq!(report.filled_qty, Quantity::from("12.34"));
+    }
+
+    #[rstest]
+    fn test_parse_partially_effective_close_fraction_keeps_declared_size() {
+        let instrument = create_stub_instrument();
+        let inst = InstrumentAny::CryptoPerpetual(instrument);
+        let account_id = AccountId::new("OKX-001");
+
+        let mut msg = stub_algo_order_msg(OKXAlgoOrderType::Conditional);
+        msg.state = OKXAlgoOrderStatus::PartiallyEffective;
+        msg.sz = "52.94".to_string();
+        msg.actual_sz = "12.34".to_string();
+        msg.close_fraction = "1".to_string();
+
+        let report =
+            parse_algo_order_status_report(&msg, &inst, account_id, UnixNanos::default()).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Triggered);
+        assert_eq!(report.quantity, Quantity::from("52.94"));
+        assert_eq!(report.filled_qty, Quantity::from("12.34"));
     }
 
     fn stub_book_entry(price: &str, size: &str) -> OrderBookEntry {

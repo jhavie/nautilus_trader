@@ -1,3 +1,20 @@
+# NautilusTrader 1.231.4 Fork
+
+Released on 31st August 2026 (UTC).
+
+Fork patch release based on `v1.231.3`, preserving its OKX conditional-stop,
+triggered-child quantity, and live reconciliation protections.
+
+### Fork Fixes
+- Use OKX `actualSz` as the authoritative terminal child quantity for fully
+  effective close-fraction algo orders instead of a stale pre-pyramid `sz`.
+- Preserve declared order size for live and partially effective algos so
+  incremental fills cannot be mistaken for the final order quantity.
+- Prevent split fills from leaving Nautilus with a stale residual position after
+  a full-position `closeFraction=1` stop has flattened the venue position.
+
+---
+
 # NautilusTrader 1.231.3 Fork
 
 Released on 29th August 2026 (UTC).
