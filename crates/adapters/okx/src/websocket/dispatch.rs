@@ -38,7 +38,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orders::TRIGGERABLE_ORDER_TYPES,
-    reports::FillReport,
+    reports::{FillReport, OrderStatusReport},
     types::{Currency, Money, Quantity},
 };
 use ustr::Ustr;
@@ -49,7 +49,7 @@ use crate::{
             OKX_FIELD_CLORDID, OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_FIELD_SUBCODE,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUCCESS_CODE,
         },
-        enums::{OKXOrderStatus, OKXOrderType},
+        enums::{OKXAlgoOrderStatus, OKXOrderStatus, OKXOrderType},
         parse::{
             is_market_price, parse_client_order_id, parse_millisecond_timestamp, parse_price,
             parse_quantity,
@@ -156,6 +156,60 @@ where
     }
 }
 
+/// Bounded key-value cache with least-recently-written FIFO eviction.
+#[derive(Debug)]
+struct BoundedValueCache<K, V> {
+    inner: Mutex<BoundedValueCacheInner<K, V>>,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct BoundedValueCacheInner<K, V> {
+    values: AHashMap<K, V>,
+    queue: VecDeque<K>,
+}
+
+impl<K, V> BoundedValueCache<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(BoundedValueCacheInner {
+                values: AHashMap::with_capacity(capacity),
+                queue: VecDeque::with_capacity(capacity),
+            }),
+            capacity,
+        }
+    }
+
+    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    fn insert(&self, key: K, value: V) {
+        let mut inner = self.inner.lock().expect(MUTEX_POISONED);
+        if inner.values.contains_key(&key) {
+            inner.queue.retain(|queued_key| queued_key != &key);
+        }
+        inner.values.insert(key.clone(), value);
+        inner.queue.push_back(key);
+        while inner.values.len() > self.capacity
+            && let Some(old_key) = inner.queue.pop_front()
+        {
+            inner.values.remove(&old_key);
+        }
+    }
+
+    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    fn get(&self, key: &K) -> Option<V> {
+        self.inner
+            .lock()
+            .expect(MUTEX_POISONED)
+            .values
+            .get(key)
+            .cloned()
+    }
+}
+
 /// Order identity context stored at submission time, used by the WS dispatch
 /// task to produce proper order events without Cache access.
 ///
@@ -180,6 +234,7 @@ pub struct WsDispatchState {
     pub filled_orders: BoundedDedup<ClientOrderId>,
     pub terminal_orders: BoundedDedup<ClientOrderId>,
     pub emitted_trades: BoundedDedup<TradeId>,
+    authoritative_close_fraction_quantities: BoundedValueCache<ClientOrderId, Quantity>,
     post_only_rejections: BoundedDedup<Ustr>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
@@ -195,6 +250,7 @@ impl Default for WsDispatchState {
             filled_orders: BoundedDedup::new(DEDUP_CAPACITY),
             terminal_orders: BoundedDedup::new(DEDUP_CAPACITY),
             emitted_trades: BoundedDedup::new(DEDUP_CAPACITY),
+            authoritative_close_fraction_quantities: BoundedValueCache::new(DEDUP_CAPACITY),
             post_only_rejections: BoundedDedup::new(DEDUP_CAPACITY),
             pending_orders: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
@@ -299,7 +355,23 @@ pub fn dispatch_ws_message(
 
             for msg in algo_msgs {
                 match parse_algo_order_msg(&msg, account_id, instruments, ts_init) {
-                    Ok(Some(report)) => reports.push(report),
+                    Ok(Some(report)) => {
+                        if !msg.close_fraction.is_empty()
+                            && matches!(
+                                msg.state,
+                                OKXAlgoOrderStatus::Effective | OKXAlgoOrderStatus::Filled
+                            )
+                            && let ExecutionReport::Order(order_report) = &report
+                            && order_report.quantity.is_positive()
+                            && order_report.quantity == order_report.filled_qty
+                            && let Some(client_order_id) = order_report.client_order_id
+                        {
+                            state
+                                .authoritative_close_fraction_quantities
+                                .insert(client_order_id, order_report.quantity);
+                        }
+                        reports.push(report);
+                    }
                     Ok(None) => {}
                     Err(e) => log::error!("Failed to parse algo order message: {e}"),
                 }
@@ -668,10 +740,11 @@ fn dispatch_order_messages(
             ) {
                 Ok(event) => {
                     if matches!(&event, ParsedOrderEvent::Fill(_))
-                        && let Some(report) = parse_terminal_triggered_child_status_report(
+                        && let Some(mut report) = parse_terminal_triggered_child_status_report(
                             msg, instrument, account_id, ts_init,
                         )
                     {
+                        apply_authoritative_close_fraction_quantity(&mut report, state);
                         ensure_accepted_emitted(
                             client_order_id,
                             account_id,
@@ -1103,10 +1176,11 @@ fn dispatch_order_msg_as_report(
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
                 let mut reports = Vec::with_capacity(2);
                 if matches!(&report, ExecutionReport::Fill(_))
-                    && let Some(status_report) = parse_terminal_triggered_child_status_report(
+                    && let Some(mut status_report) = parse_terminal_triggered_child_status_report(
                         msg, instrument, account_id, ts_init,
                     )
                 {
+                    apply_authoritative_close_fraction_quantity(&mut status_report, state);
                     reports.push(ExecutionReport::Order(status_report));
                 }
                 reports.push(report);
@@ -1116,6 +1190,31 @@ fn dispatch_order_msg_as_report(
             dispatch_execution_reports(vec![report], emitter, state);
         }
         Err(e) => log::error!("Failed to parse order message as report: {e}"),
+    }
+}
+
+fn apply_authoritative_close_fraction_quantity(
+    report: &mut OrderStatusReport,
+    state: &WsDispatchState,
+) {
+    let Some(client_order_id) = report.client_order_id else {
+        return;
+    };
+
+    if let Some(authoritative_quantity) = state
+        .authoritative_close_fraction_quantities
+        .get(&client_order_id)
+        && (report.quantity != authoritative_quantity
+            || report.filled_qty != authoritative_quantity)
+    {
+        log::debug!(
+            "Replacing triggered child quantity for closeFraction order {client_order_id}: \
+             child_sz={} child_filled_sz={} authoritative_actual_sz={authoritative_quantity}",
+            report.quantity,
+            report.filled_qty,
+        );
+        report.quantity = authoritative_quantity;
+        report.filled_qty = authoritative_quantity;
     }
 }
 
@@ -1356,7 +1455,7 @@ pub fn emit_batch_cancel_failure(
 mod tests {
     use rstest::rstest;
 
-    use super::{BoundedDedup, format_order_response_reason};
+    use super::{BoundedDedup, BoundedValueCache, format_order_response_reason};
 
     #[rstest]
     #[case("51000", "Rejected", "", "Rejected")]
@@ -1449,5 +1548,18 @@ mod tests {
         assert!(dedup.contains(&1));
         assert!(dedup.contains(&2));
         assert!(dedup.contains(&3));
+    }
+
+    #[rstest]
+    fn test_bounded_value_cache_replaces_values_and_evicts_oldest_key() {
+        let cache = BoundedValueCache::<u32, u32>::new(2);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(1, 11);
+        cache.insert(3, 30);
+
+        assert_eq!(cache.get(&1), Some(11));
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&3), Some(30));
     }
 }

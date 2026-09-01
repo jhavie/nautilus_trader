@@ -86,7 +86,7 @@ use nautilus_okx::{
             dispatch_ws_message, emit_algo_cancel_rejections, emit_batch_cancel_failure,
         },
         enums::{OKXWsChannel, OKXWsOperation},
-        messages::{ExecutionReport, OKXOrderMsg, OKXWsFrame, OKXWsMessage},
+        messages::{ExecutionReport, OKXAlgoOrderMsg, OKXOrderMsg, OKXWsFrame, OKXWsMessage},
         parse::{OrderStateSnapshot, parse_order_msg_vec},
     },
 };
@@ -376,6 +376,140 @@ fn test_dispatch_terminal_triggered_child_reports_actual_quantity_before_final_f
         }
         other => panic!("Expected accepted, terminal quantity report, then fill, was {other:?}"),
     }
+}
+
+#[rstest]
+fn test_dispatch_close_fraction_child_does_not_overwrite_authoritative_algo_quantity() {
+    let parent_client_order_id = ClientOrderId::new("BSL-CLOSE-FRACTION-STALE-CHILD");
+    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+    let instrument_key = Ustr::from("ETH-USDT-SWAP");
+    let algo_message: OKXAlgoOrderMsg = serde_json::from_value(json!({
+        "algoId": "3884151734818578432",
+        "algoClOrdId": parent_client_order_id.as_str(),
+        "clOrdId": "",
+        "ordId": "3884151734818578433",
+        "instId": instrument_key,
+        "instType": "SWAP",
+        "ordType": "conditional",
+        "state": "effective",
+        "side": "sell",
+        "posSide": "net",
+        "sz": "615.12",
+        "slTriggerPx": "105.14",
+        "slOrdPx": "-1",
+        "slTriggerPxType": "last",
+        "tdMode": "cross",
+        "lever": "1",
+        "reduceOnly": "true",
+        "closeFraction": "1",
+        "actualPx": "105.14",
+        "actualSz": "1769.90",
+        "notionalUsd": "0",
+        "triggerTime": "1779648154000",
+        "tag": "",
+        "cTime": "1779648153000",
+        "uTime": "1779648154000"
+    }))
+    .unwrap();
+    let child_message: OKXOrderMsg = serde_json::from_value(json!({
+        "accFillSz": "615.12",
+        "algoClOrdId": parent_client_order_id.as_str(),
+        "avgPx": "105.14",
+        "cTime": "1779648154000",
+        "category": "normal",
+        "ccy": "USDT",
+        "clOrdId": "O-TRIGGERED-STALE-CHILD",
+        "execType": "T",
+        "feeCcy": "USDT",
+        "fillPx": "105.14",
+        "fillSz": "615.12",
+        "fillTime": "1779648155000",
+        "instId": instrument_key,
+        "instType": "SWAP",
+        "lever": "1",
+        "ordId": "3884151734818578434",
+        "ordType": "market",
+        "pnl": "0",
+        "posSide": "net",
+        "px": "-1",
+        "reduceOnly": "true",
+        "side": "sell",
+        "state": "filled",
+        "sz": "615.12",
+        "tdMode": "cross",
+        "tradeId": "stale-child-fill",
+        "uTime": "1779648155000"
+    }))
+    .unwrap();
+
+    let (emitter, mut rx) = test_emitter();
+    let state = state_with_order_identity(parent_client_order_id, instrument_id);
+    let instruments = AtomicMap::new();
+    instruments.insert(
+        instrument_key,
+        order_instrument(
+            OKXInstrumentType::Swap,
+            instrument_id,
+            instrument_key.as_str(),
+        ),
+    );
+    let mut fee_cache = AHashMap::new();
+    let mut filled_qty_cache = AHashMap::new();
+    let mut order_state_cache = AHashMap::new();
+
+    dispatch_ws_message(
+        OKXWsMessage::AlgoOrders(vec![algo_message]),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+    let algo_events = drain_events(&mut rx);
+    assert!(matches!(
+        algo_events.as_slice(),
+        [ExecutionEvent::Report(CommonExecutionReport::Order(report))]
+            if report.quantity == Quantity::from("1769.90")
+    ));
+
+    dispatch_ws_message(
+        OKXWsMessage::Orders(vec![child_message]),
+        &emitter,
+        &state,
+        AccountId::from("OKX-001"),
+        &instruments,
+        &mut fee_cache,
+        &mut filled_qty_cache,
+        &mut order_state_cache,
+        get_atomic_clock_realtime(),
+    );
+    let child_events = drain_events(&mut rx);
+
+    assert!(child_events.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::Order(OrderEventAny::Filled(filled))
+            if filled.last_qty == Quantity::from("615.12")
+    )));
+    assert!(
+        child_events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Report(CommonExecutionReport::Order(report))
+                if report.quantity == Quantity::from("1769.90")
+                    && report.filled_qty == Quantity::from("1769.90")
+        )),
+        "authoritative child status report missing: {child_events:?}"
+    );
+    assert!(
+        !child_events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Report(CommonExecutionReport::Order(report))
+                if report.quantity == Quantity::from("615.12")
+        )),
+        "stale child quantity must not overwrite authoritative closeFraction quantity: {child_events:?}",
+    );
 }
 
 #[rstest]
