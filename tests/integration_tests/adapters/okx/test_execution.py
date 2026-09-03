@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,20 +35,26 @@ from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.events import OrderAccepted
+from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderDenied
+from nautilus_trader.model.events import OrderExpired
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
@@ -128,6 +135,283 @@ def exec_client_builder(
         return client, private_ws, business_ws, mock_http_client, mock_instrument_provider
 
     return builder
+
+
+@pytest.fixture
+def direct_accepted_case(exec_client, exec_engine, monkeypatch, instrument, msgbus):
+    client = exec_client
+    engine = exec_engine
+    assert isinstance(engine, LiveExecutionEngine)
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("BSL-late-accepted"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("10.000000"),
+        trigger_price=Price.from_str("39000.00"),
+        trigger_type=TriggerType.MARK_PRICE,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id))
+    client._cache.add_order(order, None, None)
+    captured: list = []
+    msgbus.subscribe("events.order.*", captured.append)
+    monkeypatch.setattr(client, "_send_order_event", engine._handle_event_with_tracking)
+    return client, order, captured, engine
+
+
+def _direct_accepted(
+    order: StopMarketOrder,
+    venue_id: str = "algo-123",
+) -> nautilus_pyo3.OrderAccepted:
+    event = TestEventStubs.order_accepted(
+        order,
+        venue_order_id=VenueOrderId(venue_id),
+        ts_event=10,
+    )
+    return nautilus_pyo3.OrderAccepted.from_dict(OrderAccepted.to_dict(event))
+
+
+def _accept_and_migrate_stop_to_child(order: StopMarketOrder) -> None:
+    order.apply(OrderAccepted.from_dict(_direct_accepted(order).to_dict()))
+    update = TestEventStubs.order_updated(
+        order,
+        quantity=Quantity.from_str("20.000000"),
+        ts_event=20,
+    )
+    payload = OrderUpdated.to_dict(update)
+    payload["venue_order_id"] = "child-456"
+    order.apply(OrderUpdated.from_dict(payload))
+
+
+@pytest.mark.live_components
+@pytest.mark.parametrize("terminal", ["filled", "canceled", "expired"])
+@pytest.mark.parametrize("venue_id", ["algo-123", "child-456"])
+def test_direct_accepted_drops_confirmation_after_terminal(
+    direct_accepted_case,
+    instrument,
+    terminal,
+    venue_id,
+):
+    client, order, captured, _ = direct_accepted_case
+    _accept_and_migrate_stop_to_child(order)
+    if terminal == "filled":
+        order.apply(TestEventStubs.order_filled(order, instrument, ts_event=30))
+    else:
+        factory = getattr(TestEventStubs, f"order_{terminal}")
+        order.apply(factory(order, ts_event=30))
+    before = (order.status, order.quantity, order.filled_qty, order.venue_order_id, order.events)
+
+    client._handle_order_accepted_pyo3(_direct_accepted(order, venue_id))
+
+    assert captured == []
+    assert (
+        order.status,
+        order.quantity,
+        order.filled_qty,
+        order.venue_order_id,
+        order.events,
+    ) == before
+
+
+@pytest.mark.live_components
+@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize("partially_filled", [False, True])
+def test_direct_accepted_drops_retired_parent_before_or_between_child_fills(
+    direct_accepted_case,
+    instrument,
+    restore,
+    partially_filled,
+):
+    client, order, captured, _ = direct_accepted_case
+    _accept_and_migrate_stop_to_child(order)
+    if partially_filled:
+        order.apply(
+            TestEventStubs.order_filled(
+                order,
+                instrument,
+                trade_id=TradeId("fill-1"),
+                last_qty=Quantity.from_str("7.000000"),
+                ts_event=30,
+            ),
+        )
+    if restore:
+        # Rebuild the native order from persisted events, with no adapter maps.
+        restored = StopMarketOrder.create(order.events[0])
+        for event in order.events[1:]:
+            restored.apply(event)
+        client._cache.add_order(restored, None, None, overwrite=True)
+        order = restored
+    assert not client._algo_order_ids
+    assert VenueOrderId("algo-123") in order.venue_order_ids
+
+    client._handle_order_accepted_pyo3(_direct_accepted(order))
+
+    assert captured == []
+    assert order.venue_order_id == VenueOrderId("child-456")
+    assert order.quantity == Quantity.from_str("20.000000")
+    order.apply(
+        TestEventStubs.order_filled(
+            order,
+            instrument,
+            trade_id=TradeId("fill-2"),
+            last_qty=order.leaves_qty,
+            ts_event=40,
+        ),
+    )
+    assert order.is_closed
+    assert order.filled_qty == Quantity.from_str("20.000000")
+
+
+@pytest.mark.live_components
+def test_direct_accepted_preserves_first_confirmation(direct_accepted_case):
+    client, order, captured, _ = direct_accepted_case
+
+    client._handle_order_accepted_pyo3(_direct_accepted(order))
+
+    assert len(captured) == 1
+    assert order.venue_order_id == VenueOrderId("algo-123")
+    assert not order.is_closed
+
+
+@pytest.mark.live_components
+@pytest.mark.parametrize("pending", ["update", "cancel"])
+def test_direct_accepted_preserves_confirmation_while_command_pending(
+    direct_accepted_case, pending
+):
+    client, order, captured, _ = direct_accepted_case
+    order.apply(OrderAccepted.from_dict(_direct_accepted(order).to_dict()))
+    factory = getattr(TestEventStubs, f"order_pending_{pending}")
+    order.apply(factory(order))
+
+    client._handle_order_accepted_pyo3(_direct_accepted(order))
+
+    assert len(captured) == 1
+    assert captured[0].venue_order_id == order.venue_order_id
+
+
+@pytest.mark.live_components
+@pytest.mark.parametrize("venue_id", ["child-456", "unknown-789"])
+def test_direct_accepted_does_not_hide_current_or_unknown_venue_id(direct_accepted_case, venue_id):
+    client, order, captured, _ = direct_accepted_case
+    _accept_and_migrate_stop_to_child(order)
+
+    client._handle_order_accepted_pyo3(_direct_accepted(order, venue_id))
+
+    assert len(captured) == 1
+    assert captured[0].venue_order_id == VenueOrderId(venue_id)
+
+
+@pytest.mark.live_components
+def test_direct_accepted_preserves_uncached_order(direct_accepted_case):
+    client, order, captured, engine = direct_accepted_case
+    event = _direct_accepted(order).to_dict()
+    event["client_order_id"] = "external-uncached"
+
+    client._handle_order_accepted_pyo3(nautilus_pyo3.OrderAccepted.from_dict(event))
+
+    # The admission guard must pass unknown orders to normal engine validation.
+    assert engine.event_count == 1
+    assert captured == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+@pytest.mark.parametrize("terminal", ["filled", "partially_filled", "canceled", "expired"])
+@pytest.mark.parametrize("ack_source", ["direct", "status_report"])
+async def test_queued_terminal_then_late_accepted_is_not_published(
+    direct_accepted_case, instrument, monkeypatch, terminal, ack_source
+):
+    client, order, captured, engine = direct_accepted_case
+    order.apply(OrderAccepted.from_dict(_direct_accepted(order).to_dict()))
+    # A pending command lets a business-stream ACCEPTED report generate an ack.
+    # Its preceding terminal event is queued, not yet applied to this order.
+    order.apply(TestEventStubs.order_pending_cancel(order))
+    engine._ts_last_query[order.client_order_id] = 10
+    monkeypatch.setattr(client, "_send_order_event", engine.process)
+    queue_task = asyncio.create_task(engine._run_evt_queue())
+    try:
+        if terminal in ("filled", "partially_filled"):
+            client._handle_fill_report_pyo3(
+                nautilus_pyo3.FillReport(
+                    account_id=nautilus_pyo3.AccountId(client.account_id.value),
+                    instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+                    client_order_id=nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+                    venue_order_id=nautilus_pyo3.VenueOrderId("child-456"),
+                    trade_id=nautilus_pyo3.TradeId("queue-fill"),
+                    order_side=nautilus_pyo3.OrderSide.SELL,
+                    last_qty=nautilus_pyo3.Quantity.from_str(
+                        "7.000000" if terminal == "partially_filled" else str(order.quantity),
+                    ),
+                    last_px=nautilus_pyo3.Price.from_str("39000.00"),
+                    commission=nautilus_pyo3.Money(0, nautilus_pyo3.Currency.from_str("USD")),
+                    liquidity_side=nautilus_pyo3.LiquiditySide.TAKER,
+                    report_id=nautilus_pyo3.UUID4(),
+                    ts_event=30,
+                    ts_init=30,
+                ),
+            )
+        else:
+            event_type = OrderCanceled if terminal == "canceled" else OrderExpired
+            event = getattr(TestEventStubs, f"order_{terminal}")(order, ts_event=30)
+            pyo3_type = getattr(nautilus_pyo3, event_type.__name__)
+            getattr(client, f"_handle_order_{terminal}_pyo3")(
+                pyo3_type.from_dict(event_type.to_dict(event)),
+            )
+        # No await between terminal and late ack: exercise the actual queue race.
+        assert not order.is_closed
+        if ack_source == "direct":
+            client._handle_order_accepted_pyo3(_direct_accepted(order))
+        else:
+            client._handle_internal_order_status_report(
+                OrderStatusReport(
+                    account_id=client.account_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=VenueOrderId("algo-123"),
+                    order_side=order.side,
+                    order_type=order.order_type,
+                    time_in_force=order.time_in_force,
+                    order_status=OrderStatus.ACCEPTED,
+                    quantity=order.quantity,
+                    filled_qty=Quantity.from_str("0.000000"),
+                    trigger_price=order.trigger_price,
+                    trigger_type=order.trigger_type,
+                    report_id=TestIdStubs.uuid(),
+                    ts_accepted=10,
+                    ts_last=10,
+                    ts_init=40,
+                ),
+            )
+        # Let scheduled enqueue callbacks run before appending the stop sentinel.
+        await asyncio.sleep(0)
+        await engine._evt_queue.put(engine._sentinel)
+        await asyncio.wait_for(queue_task, timeout=2)
+        assert not any(isinstance(event, OrderAccepted) for event in captured)
+        assert captured
+        if terminal == "partially_filled":
+            assert not order.is_closed
+            assert order.filled_qty == Quantity.from_str("7.000000")
+            assert order.quantity == Quantity.from_str("10.000000")
+            assert order.client_order_id in engine._order_local_activity_ns
+            assert engine._ts_last_query[order.client_order_id] == 10
+        else:
+            assert order.is_closed
+            assert order.client_order_id not in engine._order_local_activity_ns
+            assert order.client_order_id not in engine._ts_last_query
+        if terminal in ("filled", "partially_filled"):
+            assert order.venue_order_id == VenueOrderId("child-456")
+            assert [type(event) for event in captured] == [OrderUpdated, OrderFilled]
+            if terminal == "filled":
+                assert order.filled_qty == order.quantity
+    finally:
+        if not queue_task.done():
+            queue_task.cancel()
+            await asyncio.gather(queue_task, return_exceptions=True)
 
 
 def _build_bracket_order_list(

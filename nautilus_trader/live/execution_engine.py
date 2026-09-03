@@ -75,6 +75,7 @@ from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.enums import trailing_offset_type_to_str
 from nautilus_trader.model.enums import trigger_type_to_str
+from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderEvent
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
@@ -3744,7 +3745,13 @@ class LiveExecutionEngine(ExecutionEngine):
                 if client_order_id not in self._inferred_fill_ts:
                     self._inferred_fill_ts[client_order_id] = event.ts_event
 
-        self._handle_event(event)
+        # Inspect the applied order at queue consumption, not at the adapter
+        # callback: fills/venue-ID changes may already be queued ahead of an ack.
+        # This also covers acknowledgments generated from status reports.
+        if isinstance(event, OrderAccepted) and self._is_stale_order_accepted(event):
+            self._log.debug(f"Skipping stale OrderAccepted: {event}")
+        else:
+            self._handle_event(event)
 
         if event.client_order_id is None:
             return
@@ -3755,6 +3762,31 @@ class LiveExecutionEngine(ExecutionEngine):
             self._order_local_activity_ns.pop(order.client_order_id, None)
             self._inferred_fill_ts.pop(order.client_order_id, None)
             self._fill_application_audit.pop(order.client_order_id, None)
+
+    def _is_stale_order_accepted(self, event: OrderAccepted) -> bool:
+        order = self._cache.order(event.client_order_id)
+        if order is None:
+            return False
+        if order.is_closed:
+            return True
+
+        # Native history is restored with the order, so no additional adapter
+        # state is needed to recognize an already-replaced conditional parent.
+        # Keep current/unknown IDs on the normal validation path.
+        return (
+            order.order_type
+            in (
+                OrderType.STOP_MARKET,
+                OrderType.STOP_LIMIT,
+                OrderType.MARKET_IF_TOUCHED,
+                OrderType.LIMIT_IF_TOUCHED,
+                OrderType.TRAILING_STOP_MARKET,
+                OrderType.TRAILING_STOP_LIMIT,
+            )
+            and order.venue_order_id is not None
+            and event.venue_order_id != order.venue_order_id
+            and event.venue_order_id in order.venue_order_ids
+        )
 
     def _record_local_activity(self, event: OrderEvent | None) -> None:
         if event is None:

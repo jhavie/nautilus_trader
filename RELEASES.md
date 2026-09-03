@@ -1,3 +1,25 @@
+# NautilusTrader 1.231.6 Fork
+
+Released on 3rd September 2026 (UTC).
+
+Fork patch release based on `v1.231.5`, preserving its authoritative
+close-fraction quantity and conditional-stop reconciliation protections.
+
+### Fork Fixes
+- Ignore stale `OrderAccepted` events at live execution-queue consumption,
+  before order application or strategy callbacks. This covers late OKX direct
+  acknowledgments and acknowledgments generated from status reports, including
+  when earlier fills or cancellations are still queued at callback time.
+- Ignore retired conditional-parent venue IDs after the native order has
+  adopted a triggered child ID, using persisted order history rather than new
+  adapter state. Preserve legitimate current-ID and first confirmations.
+- Preserve closed-order reconciliation cleanup, legitimate fills, quantity
+  updates, and current/unknown venue-ID validation. No strategy/config changes.
+- Cover queued terminal replay, child split fills, native event-history recovery,
+  and pending commands with regression tests.
+
+---
+
 # NautilusTrader 1.231.5 Fork
 
 Released on 1st September 2026 (UTC).
