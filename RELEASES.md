@@ -1,3 +1,31 @@
+# NautilusTrader 1.231.7 Fork
+
+Released on 7th September 2026 (UTC).
+
+Fork patch release based on `v1.231.6`, preserving all previous fork fixes.
+
+### Fork Fixes
+- Preserve triggered conditional-child quantities across queued split fills.
+  Record the child venue-ID handoff before emitting its update so later fill
+  callbacks cannot overwrite the venue quantity with a stale cached parent quantity.
+  This fixes legitimate closeFraction fills rejected as overfills after pyramid
+  entries and partial exits, without disabling the engine's overfill validation.
+- Ignore retired conditional-parent ACCEPTED/TRIGGERED reports using native
+  order history and the venue-ID index, including queued and restored orders.
+- Forward `reduceOnly=true` on single WebSocket SWAP/FUTURES orders. Previously
+  the Python flag reached Rust but was omitted from the derivative wire request,
+  allowing an intended close to increase exposure.
+- Add actual execution-queue regressions for BNB/DOGE quantities, both sides,
+  increases/decreases, split fills and restored orders; verify derivative
+  reduce-only requests against a mock WebSocket server.
+
+### Scope
+These fixes do not alter strategy sizing or stop formulas. The separate
+Breakout duplicate-market-close state-machine repair belongs to nautilus_quants.
+No deployment is performed by this release.
+
+---
+
 # NautilusTrader 1.231.6 Fork
 
 Released on 3rd September 2026 (UTC).

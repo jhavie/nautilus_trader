@@ -138,7 +138,7 @@ def exec_client_builder(
 
 
 @pytest.fixture
-def direct_accepted_case(exec_client, exec_engine, monkeypatch, instrument, msgbus):
+def direct_accepted_case(exec_client, exec_engine, monkeypatch, instrument, msgbus, request):
     client = exec_client
     engine = exec_engine
     assert isinstance(engine, LiveExecutionEngine)
@@ -147,7 +147,7 @@ def direct_accepted_case(exec_client, exec_engine, monkeypatch, instrument, msgb
         strategy_id=TestIdStubs.strategy_id(),
         instrument_id=instrument.id,
         client_order_id=ClientOrderId("BSL-late-accepted"),
-        order_side=OrderSide.SELL,
+        order_side=getattr(request, "param", OrderSide.SELL),
         quantity=Quantity.from_str("10.000000"),
         trigger_price=Price.from_str("39000.00"),
         trigger_type=TriggerType.MARK_PRICE,
@@ -2628,6 +2628,184 @@ async def test_terminal_conditional_child_report_resizes_parent_before_final_fil
     assert updates[0].venue_order_id == VenueOrderId("triggered-child-terminal")
     assert len(fills) == 1
     assert fills[0].last_qty == Quantity.from_str("7.520000")
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+@pytest.mark.parametrize(
+    "status", [OrderStatus.ACCEPTED, OrderStatus.TRIGGERED, OrderStatus.FILLED]
+)
+@pytest.mark.parametrize("direct_accepted_case", [OrderSide.SELL, OrderSide.BUY], indirect=True)
+@pytest.mark.parametrize(
+    ("initial_qty", "quantities"),
+    [
+        ("10", ("9", "2", "9")),
+        ("10", ("10", "10")),
+        ("10", ("2", "1", "3")),
+        ("9046", ("8970", "203", "76", "3177")),
+        ("517.23", ("83.43", "459.76", "96.51")),
+    ],
+)
+async def test_queued_child_resize_survives_all_split_fills(
+    direct_accepted_case,
+    monkeypatch,
+    instrument,
+    status,
+    initial_qty,
+    quantities,
+):
+    client, order, captured, engine = direct_accepted_case
+    order.apply(OrderAccepted.from_dict(_direct_accepted(order).to_dict()))
+    initial_quantity = Quantity(Quantity.from_str(initial_qty).as_decimal(), 6)
+    order.apply(TestEventStubs.order_updated(order, quantity=initial_quantity))
+    total = sum(Quantity.from_str(value).as_decimal() for value in quantities)
+    quantity = Quantity(total, 6)
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    opening = TestExecStubs.market_order(
+        instrument=instrument,
+        order_side=OrderSide.BUY if order.side == OrderSide.SELL else OrderSide.SELL,
+        quantity=quantity,
+    )
+    position = Position(
+        instrument,
+        TestEventStubs.order_filled(
+            opening,
+            instrument,
+            account_id=client.account_id,
+            position_id=PositionId(f"{instrument.id}-{order.strategy_id}"),
+        ),
+    )
+    client._cache.add_position(position, OmsType.NETTING)
+    monkeypatch.setattr(client, "_send_order_event", engine.process)
+    queue_task = asyncio.create_task(engine._run_evt_queue())
+    try:
+        client._handle_internal_order_status_report(
+            OrderStatusReport(
+                account_id=client.account_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=VenueOrderId("child-456"),
+                order_side=order.side,
+                order_type=order.order_type,
+                time_in_force=order.time_in_force,
+                order_status=status,
+                quantity=quantity,
+                filled_qty=quantity
+                if status == OrderStatus.FILLED
+                else Quantity.from_str("0.000000"),
+                trigger_price=order.trigger_price,
+                trigger_type=order.trigger_type,
+                report_id=TestIdStubs.uuid(),
+                ts_accepted=10,
+                ts_last=20,
+                ts_init=20,
+            ),
+        )
+        for index, value in enumerate(quantities):
+            client._handle_fill_report_pyo3(
+                nautilus_pyo3.FillReport(
+                    account_id=nautilus_pyo3.AccountId(client.account_id.value),
+                    instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+                    client_order_id=nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+                    venue_order_id=nautilus_pyo3.VenueOrderId("child-456"),
+                    trade_id=nautilus_pyo3.TradeId(f"split-{index}"),
+                    order_side=getattr(nautilus_pyo3.OrderSide, order.side.name),
+                    last_qty=nautilus_pyo3.Quantity.from_str(
+                        format(Quantity.from_str(value).as_decimal(), ".6f"),
+                    ),
+                    last_px=nautilus_pyo3.Price.from_str("39000.00"),
+                    commission=nautilus_pyo3.Money(1, nautilus_pyo3.Currency.from_str("USD")),
+                    liquidity_side=nautilus_pyo3.LiquiditySide.TAKER,
+                    ts_event=30 + index,
+                    ts_init=30 + index,
+                ),
+            )
+        # No await: the cache still has the parent ID/quantity throughout the callbacks.
+        assert order.quantity == initial_quantity
+        await asyncio.sleep(0)
+        await engine._evt_queue.put(engine._sentinel)
+        await asyncio.wait_for(queue_task, timeout=2)
+    finally:
+        if not queue_task.done():
+            queue_task.cancel()
+            await asyncio.gather(queue_task, return_exceptions=True)
+
+    assert order.quantity == quantity
+    assert order.filled_qty == quantity
+    assert order.status == OrderStatus.FILLED
+    assert position.is_closed
+    fills = [event for event in captured if isinstance(event, OrderFilled)]
+    assert [str(event.trade_id) for event in fills] == [
+        f"split-{i}" for i in range(len(quantities))
+    ]
+    assert sum(event.commission.as_decimal() for event in fills) == len(quantities)
+    assert all(event.last_px == Price.from_str("39000.00") for event in fills)
+    assert all(event.quantity == quantity for event in captured if isinstance(event, OrderUpdated))
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+@pytest.mark.parametrize("status", [OrderStatus.ACCEPTED, OrderStatus.TRIGGERED])
+@pytest.mark.parametrize("phase", ["pending", "applied", "restored"])
+async def test_retired_parent_report_preserves_child_quantity(
+    direct_accepted_case,
+    monkeypatch,
+    msgbus,
+    status,
+    phase,
+):
+    client, order, captured, engine = direct_accepted_case
+    order.apply(OrderAccepted.from_dict(_direct_accepted(order).to_dict()))
+    monkeypatch.setattr(client, "_send_order_event", engine.process)
+    applied = asyncio.Event()
+    msgbus.subscribe("events.order.*", lambda event: applied.set())
+    queue_task = asyncio.create_task(engine._run_evt_queue())
+
+    def report(venue_id, quantity, state):
+        return OrderStatusReport(
+            account_id=client.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=VenueOrderId(venue_id),
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=state,
+            quantity=Quantity.from_str(quantity),
+            filled_qty=Quantity.from_str("0.000000"),
+            trigger_price=order.trigger_price,
+            trigger_type=order.trigger_type,
+            report_id=TestIdStubs.uuid(),
+            ts_accepted=10,
+            ts_last=20,
+            ts_init=20,
+        )
+
+    try:
+        client._handle_internal_order_status_report(
+            report("child-456", "20.000000", OrderStatus.ACCEPTED)
+        )
+        if phase != "pending":
+            await asyncio.wait_for(applied.wait(), timeout=2)
+        if phase == "restored":
+            restored = StopMarketOrder.create(order.events[0])
+            for event in order.events[1:]:
+                restored.apply(event)
+            client._cache.add_order(restored, None, None, overwrite=True)
+            order = restored
+        client._handle_internal_order_status_report(report("algo-123", "10.000000", status))
+        await asyncio.sleep(0)
+        await engine._evt_queue.put(engine._sentinel)
+        await asyncio.wait_for(queue_task, timeout=2)
+    finally:
+        if not queue_task.done():
+            queue_task.cancel()
+            await asyncio.gather(queue_task, return_exceptions=True)
+    assert order.quantity == Quantity.from_str("20.000000")
+    assert order.venue_order_id == VenueOrderId("child-456")
+    assert client._cache.venue_order_id(order.client_order_id) == order.venue_order_id
+    assert len(captured) == 1
 
 
 @pytest.mark.asyncio

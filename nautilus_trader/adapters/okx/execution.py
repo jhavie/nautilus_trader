@@ -79,7 +79,6 @@ from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
 from nautilus_trader.model.instruments import CryptoOptionSpread
@@ -210,10 +209,6 @@ class OKXExecutionClient(LiveExecutionClient):
         self._client_id_aliases: dict[ClientOrderId, ClientOrderId] = {}
         self._client_id_children: dict[ClientOrderId, ClientOrderId] = {}
         self._attached_oco_bindings: dict[ClientOrderId, OKXAttachedOcoBinding] = {}
-        self._terminal_child_resizes: dict[
-            ClientOrderId,
-            tuple[Quantity, VenueOrderId],
-        ] = {}
 
         # WebSocket API
         _private_url = config.base_url_ws or nautilus_pyo3.get_okx_ws_url_private(
@@ -2893,6 +2888,23 @@ class OKXExecutionClient(LiveExecutionClient):
         if order.is_closed:
             return
 
+        indexed_venue_id = self._cache.venue_order_id(order.client_order_id)
+        if (
+            self._is_conditional_order(order)
+            and report.order_status in (OrderStatus.ACCEPTED, OrderStatus.TRIGGERED)
+            and indexed_venue_id is not None
+            and report.venue_order_id is not None
+            and report.venue_order_id != indexed_venue_id
+            and (
+                report.venue_order_id == order.venue_order_id
+                or report.venue_order_id in order.venue_order_ids
+            )
+        ):
+            # The child may still be queued, or already restored from native
+            # history. A retired parent must not resize/migrate it backwards.
+            self._log.debug(f"Skipping retired conditional parent status: {report}")
+            return
+
         binding = self._attached_oco_binding(report.client_order_id)
         is_attached_oco_child = (
             binding is not None and report.client_order_id in binding.child_client_order_ids()
@@ -2958,6 +2970,11 @@ class OKXExecutionClient(LiveExecutionClient):
             )
 
             if venue_changed and not venue_is_original_algo:
+                self._cache.add_venue_order_id(
+                    client_order_id=order.client_order_id,
+                    venue_order_id=report.venue_order_id,
+                    overwrite=True,
+                )
                 self.generate_order_updated(
                     strategy_id=order.strategy_id,
                     instrument_id=report.instrument_id,
@@ -3028,6 +3045,11 @@ class OKXExecutionClient(LiveExecutionClient):
                 and report.venue_order_id is not None
                 and order.venue_order_id != report.venue_order_id
             ):
+                self._cache.add_venue_order_id(
+                    client_order_id=order.client_order_id,
+                    venue_order_id=report.venue_order_id,
+                    overwrite=True,
+                )
                 self.generate_order_updated(
                     strategy_id=order.strategy_id,
                     instrument_id=report.instrument_id,
@@ -3069,6 +3091,12 @@ class OKXExecutionClient(LiveExecutionClient):
                     order.venue_order_id is not None
                     and order.venue_order_id != report.venue_order_id
                 )
+                if venue_order_id_modified:
+                    self._cache.add_venue_order_id(
+                        client_order_id=order.client_order_id,
+                        venue_order_id=report.venue_order_id,
+                        overwrite=True,
+                    )
                 self.generate_order_updated(
                     strategy_id=order.strategy_id,
                     instrument_id=report.instrument_id,
@@ -3079,10 +3107,6 @@ class OKXExecutionClient(LiveExecutionClient):
                     trigger_price=order.trigger_price if order.has_trigger_price else None,
                     ts_event=report.ts_last,
                     venue_order_id_modified=venue_order_id_modified,
-                )
-                self._terminal_child_resizes[order.client_order_id] = (
-                    report.quantity,
-                    report.venue_order_id,
                 )
             self._clear_client_order_aliases(report)
         else:
@@ -3122,12 +3146,6 @@ class OKXExecutionClient(LiveExecutionClient):
             return
 
         net_last_qty = report.last_qty
-        terminal_child_resize = self._terminal_child_resizes.pop(order.client_order_id, None)
-        terminal_child_resize_matches = bool(
-            terminal_child_resize is not None
-            and report.venue_order_id is not None
-            and terminal_child_resize[1] == report.venue_order_id
-        )
 
         # For SPOT margin MARKET BUY orders, adjust ALL fills for commission
         # Commission is deducted from the base currency
@@ -3172,24 +3190,28 @@ class OKXExecutionClient(LiveExecutionClient):
             order.venue_order_id is not None
             and report.venue_order_id is not None
             and order.venue_order_id != report.venue_order_id
+            and self._cache.venue_order_id(order.client_order_id) != report.venue_order_id
         ):
+            # The venue-ID index is advanced when a child update is enqueued.
+            # The order object can still contain the parent quantity until the
+            # execution queue drains. Never overwrite that queued resize with
+            # a stale quantity on this or any subsequent split fill.
             self._cache.add_venue_order_id(
                 client_order_id=order.client_order_id,
                 venue_order_id=report.venue_order_id,
                 overwrite=True,
             )
-            if not terminal_child_resize_matches:
-                self.generate_order_updated(
-                    strategy_id=order.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=report.venue_order_id,
-                    quantity=order.quantity,
-                    price=order.price if order.has_price else None,
-                    trigger_price=order.trigger_price if order.has_trigger_price else None,
-                    ts_event=report.ts_event,
-                    venue_order_id_modified=True,
-                )
+            self.generate_order_updated(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=report.venue_order_id,
+                quantity=order.quantity,
+                price=order.price if order.has_price else None,
+                trigger_price=order.trigger_price if order.has_trigger_price else None,
+                ts_event=report.ts_event,
+                venue_order_id_modified=True,
+            )
 
         self.generate_order_filled(
             strategy_id=order.strategy_id,
@@ -3354,8 +3376,6 @@ class OKXExecutionClient(LiveExecutionClient):
 
     def _clear_order_state(self, client_order_id: ClientOrderId) -> None:
         canonical = self._canonical_client_order_id(client_order_id) or client_order_id
-        self._terminal_child_resizes.pop(client_order_id, None)
-        self._terminal_child_resizes.pop(canonical, None)
         self._clear_attached_oco_binding(client_order_id)
         self._algo_order_ids.pop(canonical, None)
         self._algo_order_instruments.pop(canonical, None)
