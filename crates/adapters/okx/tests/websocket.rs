@@ -41,7 +41,7 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
 use nautilus_network::websocket::TransportBackend;
@@ -568,6 +568,97 @@ async fn connect_client(ws_url: &str) -> OKXWebSocketClient {
         None,
     )
     .expect("failed to construct okx websocket client")
+}
+
+#[rstest::rstest]
+#[case("http_get_instruments_swap.json")]
+#[case("http_get_instruments_futures.json")]
+#[tokio::test]
+async fn test_derivative_market_close_preserves_reduce_only_on_wire(#[case] fixture: &str) {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut client = connect_client(&format!("ws://{addr}/ws")).await;
+    let response: OKXResponse<OKXInstrument> = serde_json::from_value(load_json(fixture)).unwrap();
+    let instruments: Vec<InstrumentAny> = response
+        .data
+        .iter()
+        .filter_map(|raw| {
+            parse_instrument_any(raw, None, None, None, None, UnixNanos::default())
+                .ok()
+                .flatten()
+        })
+        .collect();
+    let instrument_id = instruments[0].id();
+    client.cache_instruments(&instruments);
+    client.cache_inst_id_code(instrument_id.symbol.inner(), 10_459);
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    for (index, (side, reduce_only)) in [
+        (OrderSide::Buy, Some(true)),
+        (OrderSide::Sell, Some(true)),
+        (OrderSide::Buy, Some(false)),
+        (OrderSide::Sell, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client
+            .submit_order(
+                TraderId::from("TRADER-001"),
+                StrategyId::from("STRATEGY-001"),
+                instrument_id,
+                OKXTradeMode::Cross,
+                ClientOrderId::from(format!("CLOSE-{index}")),
+                side,
+                OrderType::Market,
+                Quantity::from("1"),
+                Some(TimeInForce::Gtc),
+                None,
+                None,
+                Some(false),
+                reduce_only,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("submit close failed");
+    }
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.order_messages.lock().await.len() == 4 }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+    let messages = state.order_messages().await;
+    for (index, message) in messages.iter().enumerate() {
+        let arg = &message["args"][0];
+        if index < 2 {
+            assert_eq!(
+                arg["reduceOnly"], true,
+                "reduce-only must reach the exchange"
+            );
+        } else {
+            assert!(arg.get("reduceOnly").is_none());
+        }
+        assert_eq!(arg["posSide"], "net");
+        assert_eq!(arg["tdMode"], "cross");
+    }
+    client.close().await.expect("close failed");
 }
 
 #[tokio::test]

@@ -2454,6 +2454,12 @@ impl OKXWebSocketClient {
                 // SWAP/FUTURES: use quote currency for margin (required by OKX)
                 builder.ccy(quote_currency.to_string());
 
+                if let Some(ro) = reduce_only
+                    && ro
+                {
+                    builder.reduce_only(ro);
+                }
+
                 // For derivatives, posSide is required by OKX
                 // Use Net for one-way mode (default for NETTING OMS)
                 if position_side.is_none() {
