@@ -49,6 +49,7 @@ from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.execution.reports import RECONCILIATION_ALIAS_RETIREMENT_REASON
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
@@ -79,6 +80,7 @@ from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
 from nautilus_trader.model.instruments import CryptoOptionSpread
@@ -97,6 +99,9 @@ class _OKXCancelAllOrdersRoute(Enum):
     BATCH_WS = "batch_ws"
     MASS_CANCEL_HTTP = "mass_cancel_http"
     SPREAD_HTTP = "spread_http"
+
+
+_MAX_UNREPORTED_CONDITIONAL_RECOVERIES = 20
 
 
 class OKXExecutionClient(LiveExecutionClient):
@@ -209,6 +214,7 @@ class OKXExecutionClient(LiveExecutionClient):
         self._client_id_aliases: dict[ClientOrderId, ClientOrderId] = {}
         self._client_id_children: dict[ClientOrderId, ClientOrderId] = {}
         self._attached_oco_bindings: dict[ClientOrderId, OKXAttachedOcoBinding] = {}
+        self._unreported_conditional_recovery_cursor = 0
 
         # WebSocket API
         _private_url = config.base_url_ws or nautilus_pyo3.get_okx_ws_url_private(
@@ -528,8 +534,12 @@ class OKXExecutionClient(LiveExecutionClient):
                     self._register_algo_order_id_from_report(report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             self._log_report_error(e, "OrderStatusReports")
+        else:
+            await self._recover_unreported_conditional_order_reports(command, reports)
 
         self._log_report_receipt(
             len(reports),
@@ -538,6 +548,127 @@ class OKXExecutionClient(LiveExecutionClient):
         )
 
         return reports
+
+    async def _recover_unreported_conditional_order_reports(
+        self,
+        command: GenerateOrderStatusReports,
+        reports: list[OrderStatusReport],
+    ) -> None:
+        reported_client_order_ids = {
+            report.client_order_id for report in reports if report.client_order_id is not None
+        }
+        cached_open_orders = self._cache.orders_open(instrument_id=command.instrument_id)
+        candidates: list[Order] = []
+
+        for order in cached_open_orders:
+            if (
+                order.client_order_id in reported_client_order_ids
+                or order.instrument_id.venue != OKX_VENUE
+                or not self._is_conditional_order(order)
+                or order.order_list_id is not None
+                or not self._order_belongs_to_execution_client(order)
+            ):
+                continue
+            candidates.append(order)
+
+        candidates.sort(key=lambda order: order.init_event.ts_init)
+        if len(candidates) > _MAX_UNREPORTED_CONDITIONAL_RECOVERIES:
+            self._log.warning(
+                "Limiting unreported OKX conditional-order recovery from "
+                f"{len(candidates)} to {_MAX_UNREPORTED_CONDITIONAL_RECOVERIES} requests",
+            )
+
+        selected_candidates = self._select_unreported_conditional_recovery_candidates(candidates)
+        for order in selected_candidates:
+            report = await self._generate_unreported_conditional_order_status_report(order)
+            if report is None:
+                continue
+            if report.client_order_id in reported_client_order_ids:
+                continue
+            if report.cancel_reason == RECONCILIATION_ALIAS_RETIREMENT_REASON:
+                self._prepare_duplicate_retirement_report(report)
+
+            self._log.info(
+                "Recovered unreported open OKX conditional order via targeted status query: "
+                f"{order.client_order_id!r} -> {report.order_status}",
+            )
+            reports.append(report)
+            if report.client_order_id is not None:
+                reported_client_order_ids.add(report.client_order_id)
+
+    def _select_unreported_conditional_recovery_candidates(
+        self,
+        candidates: list[Order],
+    ) -> list[Order]:
+        if not candidates:
+            self._unreported_conditional_recovery_cursor = 0
+            return []
+
+        start = self._unreported_conditional_recovery_cursor % len(candidates)
+        rotated = candidates[start:] + candidates[:start]
+        selected = rotated[:_MAX_UNREPORTED_CONDITIONAL_RECOVERIES]
+        self._unreported_conditional_recovery_cursor = (start + len(selected)) % len(candidates)
+        return selected
+
+    def _prepare_duplicate_retirement_report(self, report: OrderStatusReport) -> None:
+        physical_venue_order_id = report.venue_order_id
+        canonical_client_order_id = next(iter(report.linked_order_ids or []), None)
+        if canonical_client_order_id is not None:
+            self._cache.add_venue_order_id(
+                canonical_client_order_id,
+                physical_venue_order_id,
+                overwrite=True,
+            )
+
+        # ExecutionMassStatus keys orders and fills by venue ID. The synthetic retirement must
+        # not consume the physical child's fills or overwrite the canonical parent report.
+        report.venue_order_id = VenueOrderId(f"RECON-{report.id.value}")
+
+    async def _generate_unreported_conditional_order_status_report(
+        self,
+        order: Order,
+    ) -> OrderStatusReport | None:
+        canonical_client_order_id = self._canonical_client_order_id(order.client_order_id)
+        if canonical_client_order_id is None:
+            return None
+
+        command = GenerateOrderStatusReport(
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(order.instrument_id.value)
+        return await self._resolve_algo_fallback(
+            canonical_client_order_id,
+            command,
+            pyo3_instrument_id,
+        )
+
+    def _order_belongs_to_execution_client(self, order: Order) -> bool:
+        routed_client_id = self._cache.client_id(order.client_order_id)
+        if routed_client_id is not None:
+            return routed_client_id == self.id
+        if order.account_id is not None:
+            return order.account_id == self.account_id
+
+        related_ids = [order.parent_order_id, *(order.linked_order_ids or [])]
+        for related_id in related_ids:
+            if related_id is None:
+                continue
+            related_order = self._cache.order(related_id)
+            if related_order is None:
+                continue
+            related_client_id = self._cache.client_id(related_id)
+            if related_client_id is not None:
+                if related_client_id == self.id:
+                    return True
+                continue
+            if related_order.account_id == self.account_id:
+                return True
+
+        return False
 
     async def generate_order_status_report(
         self,
@@ -3496,7 +3627,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 duplicate_order.trigger_type if duplicate_order.has_trigger_price else None
             ),
             reduce_only=duplicate_order.is_reduce_only,
-            cancel_reason="Retired duplicate OKX reconciliation alias",
+            cancel_reason=RECONCILIATION_ALIAS_RETIREMENT_REASON,
             report_id=UUID4(),
             ts_accepted=report.ts_accepted,
             ts_last=report.ts_last,

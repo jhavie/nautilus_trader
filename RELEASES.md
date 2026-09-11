@@ -1,3 +1,26 @@
+# NautilusTrader 1.231.9 Fork
+
+Released on 11th September 2026 (UTC).
+
+Fork patch release based on `v1.231.8`, preserving all previous fork fixes.
+
+### Fork Fixes
+- Recover locally open OKX conditional orders that are absent from bulk status
+  responses by issuing a targeted status query for each unreported order.
+- Apply the recovery during both startup history reconciliation and periodic
+  open-order checks, including when `open_check_open_only` is enabled.
+- Resolve a triggered conditional parent through its generated ordinary child,
+  then report the parent as filled and retire the duplicate local child as
+  canceled. This clears persisted stop ghosts before strategy startup can
+  repeatedly cancel them or block a new entry.
+
+### Scope
+The patch changes OKX reconciliation for unreported locally open conditional
+orders only. It does not alter strategy signals, stop formulas, position sizing,
+average-entry calculations, or ordinary open-order reconciliation.
+
+---
+
 # NautilusTrader 1.231.8 Fork
 
 Released on 11th September 2026 (UTC).

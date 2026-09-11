@@ -170,6 +170,7 @@ def create_order_canceled_event(
     order: Order,
     ts_now: int,
     report: OrderStatusReport | None = None,
+    venue_order_id: VenueOrderId | None = None,
 ) -> OrderCanceled:
     """
     Create an OrderCanceled event for reconciliation.
@@ -185,6 +186,9 @@ def create_order_canceled_event(
         The current timestamp in nanoseconds.
     report : OrderStatusReport, optional
         The order status report from the venue (if available).
+    venue_order_id : VenueOrderId, optional
+        An explicit venue order ID for the event. This is used when the report has a
+        synthetic reconciliation identity but the cached order retains the physical ID.
 
     Returns
     -------
@@ -198,7 +202,7 @@ def create_order_canceled_event(
             strategy_id=order.strategy_id,
             instrument_id=report.instrument_id,
             client_order_id=report.client_order_id,
-            venue_order_id=report.venue_order_id,
+            venue_order_id=venue_order_id or report.venue_order_id,
             account_id=report.account_id,
             event_id=UUID4(),
             ts_event=report.ts_last,
