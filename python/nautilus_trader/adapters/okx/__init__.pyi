@@ -265,6 +265,13 @@ class OKXHttpClient:
         open_only: bool = False,
         limit: int | None = None,
     ) -> typing.Any: ...
+    def request_order_status_report(
+        self,
+        account_id: model.AccountId,
+        instrument_id: model.InstrumentId,
+        venue_order_id: model.VenueOrderId | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
     def request_algo_order_status_reports(
         self,
         account_id: model.AccountId,

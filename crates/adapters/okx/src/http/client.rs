@@ -102,13 +102,13 @@ use super::{
         GetInstrumentsParams, GetInstrumentsParamsBuilder, GetMarkPriceParams,
         GetMarkPriceParamsBuilder, GetOptionSummaryParams, GetOrderBookParams,
         GetOrderHistoryParams, GetOrderHistoryParamsBuilder, GetOrderListParams,
-        GetOrderListParamsBuilder, GetPositionTiersParams, GetPositionsHistoryParams,
-        GetPositionsParams, GetPositionsParamsBuilder, GetPriceLimitParams,
-        GetPriceLimitParamsBuilder, GetRpiOrderBookParams, GetSpreadOrderParams,
-        GetSpreadOrdersParams, GetSpreadOrdersParamsBuilder, GetSpreadTradesParams,
-        GetSpreadTradesParamsBuilder, GetSpreadsParams, GetTradeFeeParams, GetTradesParams,
-        GetTradesParamsBuilder, GetTransactionDetailsParams, GetTransactionDetailsParamsBuilder,
-        SetPositionModeParams, SetPositionModeParamsBuilder,
+        GetOrderListParamsBuilder, GetOrderParamsBuilder, GetPositionTiersParams,
+        GetPositionsHistoryParams, GetPositionsParams, GetPositionsParamsBuilder,
+        GetPriceLimitParams, GetPriceLimitParamsBuilder, GetRpiOrderBookParams,
+        GetSpreadOrderParams, GetSpreadOrdersParams, GetSpreadOrdersParamsBuilder,
+        GetSpreadTradesParams, GetSpreadTradesParamsBuilder, GetSpreadsParams, GetTradeFeeParams,
+        GetTradesParams, GetTradesParamsBuilder, GetTransactionDetailsParams,
+        GetTransactionDetailsParamsBuilder, SetPositionModeParams, SetPositionModeParamsBuilder,
     },
 };
 use crate::{
@@ -4109,6 +4109,54 @@ impl OKXHttpClient {
         }
 
         Ok(reports)
+    }
+
+    /// Requests a single order status report by venue or client order identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither identifier is provided, the request fails, or
+    /// the response cannot be parsed.
+    pub async fn request_order_status_report(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        if venue_order_id.is_none() && client_order_id.is_none() {
+            anyhow::bail!("venue_order_id or client_order_id required for order query");
+        }
+
+        let instrument = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let mut params_builder = GetOrderParamsBuilder::default();
+        params_builder
+            .inst_type(okx_instrument_type(&instrument)?)
+            .inst_id(instrument_id.symbol.inner().to_string());
+
+        if let Some(venue_order_id) = venue_order_id {
+            params_builder.ord_id(venue_order_id.as_str().to_string());
+        }
+        if let Some(client_order_id) = client_order_id {
+            params_builder.cl_ord_id(client_order_id.as_str().to_string());
+        }
+
+        let params = params_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!(format!("Failed to build order query params: {e}")))?;
+        let Some(order) = self.inner.get_order(params).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        let report = parse_order_status_report(
+            &order,
+            account_id,
+            instrument.id(),
+            instrument.price_precision(),
+            instrument.size_precision(),
+            self.generate_ts_init(),
+        )?;
+
+        Ok(Some(report))
     }
 
     /// Requests spread order status reports for the given parameters.

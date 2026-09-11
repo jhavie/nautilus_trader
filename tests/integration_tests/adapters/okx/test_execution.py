@@ -30,6 +30,7 @@ from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
@@ -42,6 +43,7 @@ from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.events import OrderAccepted
@@ -576,6 +578,471 @@ def _zero_quantity_algo_status_report(
 
 
 @pytest.mark.asyncio
+async def test_status_report_prefers_tracked_conditional_parent_over_exchange_child(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    parent_id = ClientOrderId("BSLD9DFA96666A492A902CA")
+    child_id = ClientOrderId("O3911981633930121216")
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=parent_id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("54.05"),
+        trigger_price=Price.from_str("76945.93"),
+        trigger_type=TriggerType.MARK_PRICE,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=client.account_id,
+            venue_order_id=VenueOrderId("3910497317996052480"),
+        ),
+    )
+    client._cache.add_order(order, None, None)
+    report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=child_id,
+        venue_order_id=VenueOrderId("3911981634086502400"),
+        linked_order_ids=[parent_id],
+        order_side=OrderSide.BUY,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.FILLED,
+        quantity=Quantity.from_str("226.84"),
+        filled_qty=Quantity.from_str("226.84"),
+        avg_px=76949.4939001058,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+
+    client._apply_client_order_alias(report)
+
+    assert report.client_order_id == parent_id
+    assert report.linked_order_ids == [child_id]
+    assert client._canonical_client_order_id(parent_id) == parent_id
+    assert client._canonical_client_order_id(child_id) == parent_id
+    assert client._exchange_client_order_id(parent_id) == child_id
+
+
+def _cache_triggered_child_incident(
+    client: OKXExecutionClient,
+    exec_engine,
+    instrument,
+) -> tuple[StopMarketOrder, StopMarketOrder, OrderStatusReport]:
+    parent_id = ClientOrderId("BSLD9DFA96666A492A902CA")
+    child_id = ClientOrderId("O3911981633930121216")
+    child_venue_id = VenueOrderId("3911981634086502400")
+    parent_order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=parent_id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("54.05"),
+        trigger_price=Price.from_str("76945.93"),
+        trigger_type=TriggerType.MARK_PRICE,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    parent_order.apply(TestEventStubs.order_submitted(parent_order, account_id=client.account_id))
+    parent_order.apply(
+        TestEventStubs.order_accepted(
+            parent_order,
+            account_id=client.account_id,
+            venue_order_id=VenueOrderId("3910497317996052480"),
+        ),
+    )
+    client._cache.add_order(parent_order, None, None)
+
+    child_report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=child_id,
+        venue_order_id=child_venue_id,
+        linked_order_ids=[parent_id],
+        order_side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        time_in_force=parent_order.time_in_force,
+        order_status=OrderStatus.FILLED,
+        quantity=Quantity.from_str("226.84"),
+        filled_qty=Quantity.from_str("226.84"),
+        avg_px=76949.4939001058,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+    ghost_report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=child_id,
+        venue_order_id=child_venue_id,
+        linked_order_ids=[parent_id],
+        order_side=OrderSide.BUY,
+        order_type=OrderType.STOP_MARKET,
+        time_in_force=parent_order.time_in_force,
+        order_status=OrderStatus.TRIGGERED,
+        quantity=Quantity.from_str("226.84"),
+        filled_qty=Quantity.from_str("226.84"),
+        trigger_price=parent_order.trigger_price,
+        trigger_type=parent_order.trigger_type,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+    ghost_order = exec_engine._generate_order(ghost_report)
+    assert ghost_order is not None
+    ghost_order.apply(
+        TestEventStubs.order_accepted(
+            ghost_order,
+            account_id=client.account_id,
+            venue_order_id=child_venue_id,
+        ),
+    )
+    client._cache.add_order(ghost_order, None, None)
+    assert not parent_order.init_event.reconciliation
+    assert ghost_order.init_event.ts_init > parent_order.init_event.ts_init
+    assert client._cache.order(parent_id) is parent_order
+    assert client._cache.order(child_id) is ghost_order
+    assert client._select_report_canonical_client_order_id(child_id, [parent_id]) == parent_id
+
+    return parent_order, ghost_order, child_report
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+async def test_status_lookup_retires_reconciled_child_duplicate_after_parent_recovery(
+    exec_client_builder,
+    exec_engine,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    _, _, child_report = _cache_triggered_child_incident(client, exec_engine, instrument)
+    parent_id = ClientOrderId("BSLD9DFA96666A492A902CA")
+    child_id = ClientOrderId("O3911981633930121216")
+    child_venue_id = VenueOrderId("3911981634086502400")
+
+    http_client.request_order_status_reports.return_value = [child_report.to_pyo3()]
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=child_id,
+        venue_order_id=child_venue_id,
+        command_id=TestIdStubs.uuid(),
+        ts_init=40,
+    )
+
+    report = await client.generate_order_status_report(command)
+
+    assert report is not None
+    assert report.client_order_id == child_id
+    assert report.order_status == OrderStatus.CANCELED
+    assert report.filled_qty == Quantity.from_str("0.00")
+    assert report.linked_order_ids == [parent_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+async def test_triggered_algo_fallback_fetches_authoritative_child_terminal_status(
+    exec_client_builder,
+    exec_engine,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    parent_order, ghost_order, child_report = _cache_triggered_child_incident(
+        client,
+        exec_engine,
+        instrument,
+    )
+    parent_id = parent_order.client_order_id
+    child_id = ghost_order.client_order_id
+    child_venue_id = ghost_order.venue_order_id
+    triggered_algo_report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=parent_id,
+        venue_order_id=child_venue_id,
+        order_side=parent_order.side,
+        order_type=parent_order.order_type,
+        time_in_force=parent_order.time_in_force,
+        order_status=OrderStatus.TRIGGERED,
+        quantity=Quantity.from_str("226.84"),
+        filled_qty=Quantity.from_str("226.84"),
+        trigger_price=parent_order.trigger_price,
+        trigger_type=parent_order.trigger_type,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+    client._register_client_order_aliases(child_id, [parent_id])
+    http_client.request_order_status_reports.return_value = []
+    http_client.request_algo_order_status_report = AsyncMock(
+        side_effect=[None, triggered_algo_report.to_pyo3()],
+    )
+    http_client.request_order_status_report = AsyncMock(return_value=child_report.to_pyo3())
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=child_id,
+        venue_order_id=child_venue_id,
+        command_id=TestIdStubs.uuid(),
+        ts_init=40,
+    )
+
+    report = await client.generate_order_status_report(command)
+
+    assert report is not None
+    assert report.client_order_id == child_id
+    assert report.order_status == OrderStatus.CANCELED
+    assert report.linked_order_ids == [parent_id]
+    http_client.request_order_status_report.assert_awaited_once_with(
+        account_id=client.pyo3_account_id,
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId(child_venue_id.value),
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_status_aliasing_preserves_attached_oco_parent_after_restart(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    order_list, entry_order, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    for order in order_list.orders:
+        client._cache.add_order(order, None, None)
+    client._attached_oco_bindings.clear()
+
+    venue_report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=entry_order.client_order_id,
+        venue_order_id=VenueOrderId("3911981634086503000"),
+        linked_order_ids=[sl_order.client_order_id, tp_order.client_order_id],
+        order_side=entry_order.side,
+        order_type=entry_order.order_type,
+        time_in_force=entry_order.time_in_force,
+        order_status=OrderStatus.ACCEPTED,
+        quantity=entry_order.quantity,
+        filled_qty=Quantity.zero(entry_order.quantity.precision),
+        reduce_only=entry_order.is_reduce_only,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+    http_client.request_order_status_reports.return_value = [venue_report.to_pyo3()]
+    command = GenerateOrderStatusReports(
+        instrument_id=instrument.id,
+        start=None,
+        end=None,
+        open_only=False,
+        command_id=TestIdStubs.uuid(),
+        ts_init=40,
+    )
+
+    reports = await client.generate_order_status_reports(command)
+
+    assert len(reports) == 1
+    assert reports[0].client_order_id == entry_order.client_order_id
+    assert reports[0].linked_order_ids == [sl_order.client_order_id, tp_order.client_order_id]
+    binding = client._attached_oco_binding(sl_order.client_order_id)
+    assert binding is not None
+    assert binding.parent_client_order_id == entry_order.client_order_id
+    assert binding.sl_client_order_id == sl_order.client_order_id
+    assert binding.tp_client_order_id == tp_order.client_order_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+async def test_filled_child_report_closes_tracked_pyramid_stop_without_external_order(
+    exec_client_builder,
+    exec_engine,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    position = _add_open_position(client, instrument, Quantity.from_str("226.84"))
+    parent_id = ClientOrderId("BSLD9DFA96666A492A902CA")
+    child_id = ClientOrderId("O3911981633930121216")
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=position.strategy_id,
+        instrument_id=instrument.id,
+        client_order_id=parent_id,
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("54.05"),
+        trigger_price=Price.from_str("76945.93"),
+        trigger_type=TriggerType.MARK_PRICE,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=client.account_id,
+            venue_order_id=VenueOrderId("3910497317996052480"),
+        ),
+    )
+    client._cache.add_order(order, position.id, None)
+    report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=child_id,
+        venue_order_id=VenueOrderId("3911981634086502400"),
+        linked_order_ids=[parent_id],
+        order_side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.FILLED,
+        quantity=Quantity.from_str("226.84"),
+        filled_qty=Quantity.from_str("226.84"),
+        avg_px=76949.4939001058,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+    client._apply_client_order_alias(report)
+
+    reconciled = exec_engine._reconcile_order_report(report, trades=[], is_external=False)
+
+    assert reconciled
+    assert report.client_order_id == parent_id
+    assert client._cache.order(child_id) is None
+    assert order.status == OrderStatus.FILLED
+    assert order.quantity == Quantity.from_str("226.84")
+    assert order.filled_qty == order.quantity
+    assert position.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+async def test_recovered_terminal_stop_does_not_reopen_already_flat_position(
+    exec_client_builder,
+    exec_engine,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    quantity = Quantity.from_str("226.84")
+    position = _add_open_position(client, instrument, quantity)
+    close_order = TestExecStubs.market_order(
+        instrument=instrument,
+        order_side=OrderSide.SELL,
+        quantity=quantity,
+    )
+    position.apply(
+        TestEventStubs.order_filled(
+            close_order,
+            instrument,
+            account_id=client.account_id,
+            position_id=position.id,
+        ),
+    )
+    assert position.is_closed
+
+    parent_id = ClientOrderId("BSLD9DFA96666A492A902CA")
+    stop_order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=position.strategy_id,
+        instrument_id=instrument.id,
+        client_order_id=parent_id,
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("54.05"),
+        trigger_price=Price.from_str("76945.93"),
+        trigger_type=TriggerType.MARK_PRICE,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    stop_order.apply(TestEventStubs.order_submitted(stop_order, account_id=client.account_id))
+    stop_order.apply(
+        TestEventStubs.order_accepted(
+            stop_order,
+            account_id=client.account_id,
+            venue_order_id=VenueOrderId("3910497317996052480"),
+        ),
+    )
+    client._cache.add_order(stop_order, position.id, None)
+    report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=parent_id,
+        venue_order_id=VenueOrderId("3911981634086502400"),
+        linked_order_ids=[ClientOrderId("O3911981633930121216")],
+        order_side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        time_in_force=stop_order.time_in_force,
+        order_status=OrderStatus.FILLED,
+        quantity=quantity,
+        filled_qty=quantity,
+        avg_px=76949.4939001058,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=20,
+        ts_init=30,
+    )
+
+    reconciled = exec_engine._reconcile_order_report(report, trades=[], is_external=False)
+
+    assert reconciled
+    assert stop_order.status == OrderStatus.FILLED
+    assert position.is_closed
+
+
+@pytest.mark.asyncio
 async def test_connect_success(exec_client_builder, monkeypatch):
     # Arrange
     client, private_ws, business_ws, http_client, instrument_provider = exec_client_builder(
@@ -646,7 +1113,7 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
     # Arrange
     client, _, _, http_client, _ = exec_client_builder(monkeypatch)
 
-    expected_report = MagicMock()
+    expected_report = MagicMock(client_order_id=None, linked_order_ids=None)
     monkeypatch.setattr(
         "nautilus_trader.adapters.okx.execution.OrderStatusReport.from_pyo3",
         lambda obj: expected_report,
@@ -685,8 +1152,10 @@ async def test_generate_order_status_reports_includes_open_algo_orders(
     algo_report = MagicMock(name="algo-report")
     regular_report.quantity = "1"
     algo_report.quantity = "1"
-    expected_regular = MagicMock(name="expected-regular")
-    expected_algo = MagicMock(name="expected-algo")
+    expected_regular = MagicMock(name="expected-regular", client_order_id=None)
+    expected_regular.linked_order_ids = None
+    expected_algo = MagicMock(name="expected-algo", client_order_id=None)
+    expected_algo.linked_order_ids = None
     converted = {
         regular_report: expected_regular,
         algo_report: expected_algo,

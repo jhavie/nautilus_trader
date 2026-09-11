@@ -1,3 +1,30 @@
+# NautilusTrader 1.231.8 Fork
+
+Released on 11th September 2026 (UTC).
+
+Fork patch release based on `v1.231.7`, preserving all previous fork fixes.
+
+### Fork Fixes
+- Keep an OKX triggered conditional child's `algoClOrdId` as the canonical
+  Nautilus client order ID in HTTP history, matching the WebSocket parser.
+- Resolve linked order reports to the earliest tracked native order so the
+  exchange-generated child `clOrdId` cannot replace its conditional parent.
+- When an algo fallback reports `TRIGGERED`, query the generated child by its
+  venue order ID and use that ordinary order's terminal state instead of
+  inferring completion from the algo quantity fields.
+- Retire duplicate local child orders created by earlier child-first
+  reconciliation after the physical venue order reaches a terminal state.
+- Cover the observed BTC full-position stop after pyramid sizing: the 54.05
+  parent is updated to the 226.84 child quantity, the fill remains on the
+  original stop, and an already-flat cached position is not reopened.
+
+### Scope
+The patch changes OKX conditional-order identity and reconciliation only. It
+does not alter strategy entry logic, average-entry calculations, stop prices,
+position sizing, or overfill validation.
+
+---
+
 # NautilusTrader 1.231.7 Fork
 
 Released on 7th September 2026 (UTC).
