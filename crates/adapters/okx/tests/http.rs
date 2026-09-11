@@ -2414,6 +2414,55 @@ async fn test_http_get_order_by_client_and_exchange_ids() {
     assert_eq!(query.get("clOrdId"), Some(&"client-order-1".to_string()));
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_http_request_order_status_report_by_venue_order_id() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let base_url = format!("http://{addr}");
+
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(base_url),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    let report = client
+        .request_order_status_report(
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            Some(nautilus_model::identifiers::VenueOrderId::from(
+                "2497956918703120384",
+            )),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("expected order status report");
+
+    assert_eq!(report.venue_order_id.as_str(), "2497956918703120384");
+    assert_eq!(report.order_status, OrderStatus::Filled);
+    assert_eq!(report.quantity, Quantity::from("0.03"));
+    assert_eq!(report.filled_qty, Quantity::from("0.03"));
+
+    let query = state.last_order_detail_query.lock().await.clone().unwrap();
+    assert_eq!(query.get("instType"), Some(&"SWAP".to_string()));
+    assert_eq!(query.get("instId"), Some(&"BTC-USDT-SWAP".to_string()));
+    assert_eq!(query.get("ordId"), Some(&"2497956918703120384".to_string()),);
+    assert!(!query.contains_key("clOrdId"));
+}
+
 #[tokio::test]
 async fn test_request_trades_pagination_parameters() {
     let state = Arc::new(TestServerState::default());

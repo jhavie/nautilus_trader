@@ -8737,6 +8737,13 @@ class OKXHttpClient:
         open_only: bool = False,
         limit: int | None = None,
     ) -> list[OrderStatusReport]: ...
+    async def request_order_status_report(
+        self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        venue_order_id: VenueOrderId | None = None,
+        client_order_id: ClientOrderId | None = None,
+    ) -> OrderStatusReport | None: ...
     async def request_algo_order_status_reports(
         self,
         account_id: AccountId,

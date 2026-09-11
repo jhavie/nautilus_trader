@@ -449,7 +449,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
     # -- EXECUTION REPORTS ------------------------------------------------------------------------
 
-    async def generate_order_status_reports(
+    async def generate_order_status_reports(  # noqa: C901 (too complex)
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
@@ -572,9 +572,6 @@ class OKXExecutionClient(LiveExecutionClient):
                 instrument_id=pyo3_instrument_id,
             )
 
-            if not pyo3_reports:
-                return None
-
             # Filter for the specific order we're looking for
             self._log.warning(
                 f"Resolving order status lookup for requested {command.client_order_id!r} -> canonical {canonical_requested_id!r}",
@@ -590,6 +587,10 @@ class OKXExecutionClient(LiveExecutionClient):
                     and canonical_report_id is not None
                     and canonical_report_id == canonical_requested_id
                 ) or (command.venue_order_id and report.venue_order_id == command.venue_order_id):
+                    report = self._retire_status_alias_duplicate(
+                        requested_client_order_id=command.client_order_id,
+                        report=report,
+                    )
                     self._log.debug(f"Received {report}", LogColor.MAGENTA)
                     return report
         except (asyncio.CancelledError, Exception) as e:
@@ -629,7 +630,11 @@ class OKXExecutionClient(LiveExecutionClient):
             )
 
             if candidate_report is not None:
-                return candidate_report
+                return await self._resolve_triggered_algo_child_report(
+                    candidate_report,
+                    command.client_order_id,
+                    pyo3_instrument_id,
+                )
             algo_id = self._algo_order_ids.get(candidate)
             if algo_id is not None:
                 algo_ids.add(algo_id)
@@ -641,7 +646,11 @@ class OKXExecutionClient(LiveExecutionClient):
             )
 
             if candidate_report is not None:
-                return candidate_report
+                return await self._resolve_triggered_algo_child_report(
+                    candidate_report,
+                    command.client_order_id,
+                    pyo3_instrument_id,
+                )
 
         exchange_client_order_id = self._exchange_client_order_id(command.client_order_id)
         algo_ids_repr = sorted(algo_ids) if algo_ids else None
@@ -652,6 +661,48 @@ class OKXExecutionClient(LiveExecutionClient):
         )
 
         return None
+
+    async def _resolve_triggered_algo_child_report(
+        self,
+        algo_report: OrderStatusReport,
+        requested_client_order_id: ClientOrderId | None,
+        pyo3_instrument_id: nautilus_pyo3.InstrumentId,
+    ) -> OrderStatusReport:
+        if algo_report.order_status != OrderStatus.TRIGGERED:
+            return algo_report
+
+        try:
+            child_report_pyo3 = await self._http_client.request_order_status_report(
+                account_id=self.pyo3_account_id,
+                instrument_id=pyo3_instrument_id,
+                venue_order_id=nautilus_pyo3.VenueOrderId(algo_report.venue_order_id.value),
+            )
+            if child_report_pyo3 is None:
+                return algo_report
+
+            child_report = OrderStatusReport.from_pyo3(child_report_pyo3)
+            self._apply_client_order_alias(child_report)
+            child_report = self._retire_status_alias_duplicate(
+                requested_client_order_id=requested_client_order_id,
+                report=child_report,
+            )
+            self._log.debug(
+                "Resolved triggered OKX algo child to authoritative ordinary order status "
+                f"for venue_order_id={algo_report.venue_order_id!r}",
+            )
+            return child_report
+        except ValueError as e:
+            if "404" in str(e) or "Not Found" in str(e):
+                self._log.debug(
+                    "OKX triggered child order status not found for "
+                    f"venue_order_id={algo_report.venue_order_id!r} (404)",
+                )
+            else:
+                self._log.exception("Failed to resolve triggered OKX child OrderStatusReport", e)
+        except Exception as e:
+            self._log.exception("Failed to resolve triggered OKX child OrderStatusReport", e)
+
+        return algo_report
 
     async def _fetch_algo_order_status_report(
         self,
@@ -3324,23 +3375,132 @@ class OKXExecutionClient(LiveExecutionClient):
 
         if linked_ids:
             linked_ids = list(linked_ids)
-            report.linked_order_ids = linked_ids
+        else:
+            linked_ids = []
 
-        self._register_client_order_aliases(parent_id, linked_ids)
-
-        canonical_id = self._canonical_client_order_id(parent_id)
-        if canonical_id is None or parent_id == canonical_id:
+        canonical_id = self._select_report_canonical_client_order_id(parent_id, linked_ids)
+        if canonical_id is None:
             return
 
-        if not report.linked_order_ids:
-            report.linked_order_ids = []
+        related_ids = [
+            identifier
+            for identifier in [parent_id, *linked_ids]
+            if identifier is not None and identifier != canonical_id
+        ]
+        related_ids = list(dict.fromkeys(related_ids))
 
-        if parent_id not in report.linked_order_ids:
-            report.linked_order_ids.append(parent_id)
+        # A prior child-first status report may already have inverted this
+        # relationship. Re-root it before registering the complete alias set.
+        self._client_id_aliases[canonical_id] = canonical_id
+        self._client_id_children[canonical_id] = canonical_id
+        self._register_client_order_aliases(canonical_id, related_ids)
 
         report.client_order_id = canonical_id
+        report.linked_order_ids = related_ids or None
+        if parent_id == canonical_id:
+            return
+
         self._log.debug(
             f"Applied OKX alias: parent {parent_id!r} -> canonical {canonical_id!r} with linked {report.linked_order_ids}",
+        )
+
+    def _select_report_canonical_client_order_id(
+        self,
+        report_client_order_id: ClientOrderId | None,
+        linked_order_ids: list[ClientOrderId],
+    ) -> ClientOrderId | None:
+        candidates = [
+            identifier
+            for identifier in [report_client_order_id, *linked_order_ids]
+            if identifier is not None
+        ]
+        candidates = list(dict.fromkeys(candidates))
+        if not candidates:
+            return None
+
+        cached_orders = {
+            identifier: order
+            for identifier in candidates
+            if (order := self._cache.order(identifier)) is not None
+        }
+        if len(cached_orders) == 1:
+            return next(iter(cached_orders))
+        if len(cached_orders) > 1:
+            earliest_ts = min(order.init_event.ts_init for order in cached_orders.values())
+            earliest_ids = [
+                identifier
+                for identifier, order in cached_orders.items()
+                if order.init_event.ts_init == earliest_ts
+            ]
+            if len(earliest_ids) == 1:
+                return earliest_ids[0]
+        if report_client_order_id in cached_orders:
+            return report_client_order_id
+
+        canonical_id = self._canonical_client_order_id(report_client_order_id)
+        return canonical_id or report_client_order_id
+
+    def _retire_status_alias_duplicate(
+        self,
+        requested_client_order_id: ClientOrderId | None,
+        report: OrderStatusReport,
+    ) -> OrderStatusReport:
+        if (
+            requested_client_order_id is None
+            or report.client_order_id is None
+            or requested_client_order_id == report.client_order_id
+            or requested_client_order_id not in (report.linked_order_ids or [])
+            or report.order_status
+            not in (
+                OrderStatus.REJECTED,
+                OrderStatus.CANCELED,
+                OrderStatus.EXPIRED,
+                OrderStatus.FILLED,
+            )
+        ):
+            return report
+
+        canonical_order = self._cache.order(report.client_order_id)
+        duplicate_order = self._cache.order(requested_client_order_id)
+        if (
+            canonical_order is None
+            or duplicate_order is None
+            or canonical_order.order_list_id is not None
+            or duplicate_order.order_list_id is not None
+            or duplicate_order.init_event.ts_init <= canonical_order.init_event.ts_init
+            or duplicate_order.venue_order_id != report.venue_order_id
+        ):
+            return report
+
+        self._log.warning(
+            "Retiring duplicate reconciled OKX child order "
+            f"{requested_client_order_id!r}; physical venue order {report.venue_order_id!r} "
+            f"belongs to canonical {report.client_order_id!r}",
+        )
+        return OrderStatusReport(
+            account_id=report.account_id,
+            instrument_id=duplicate_order.instrument_id,
+            client_order_id=requested_client_order_id,
+            venue_order_id=duplicate_order.venue_order_id,
+            linked_order_ids=[report.client_order_id],
+            order_side=duplicate_order.side,
+            order_type=duplicate_order.order_type,
+            time_in_force=duplicate_order.time_in_force,
+            order_status=OrderStatus.CANCELED,
+            quantity=duplicate_order.quantity,
+            filled_qty=duplicate_order.filled_qty,
+            trigger_price=(
+                duplicate_order.trigger_price if duplicate_order.has_trigger_price else None
+            ),
+            trigger_type=(
+                duplicate_order.trigger_type if duplicate_order.has_trigger_price else None
+            ),
+            reduce_only=duplicate_order.is_reduce_only,
+            cancel_reason="Retired duplicate OKX reconciliation alias",
+            report_id=UUID4(),
+            ts_accepted=report.ts_accepted,
+            ts_last=report.ts_last,
+            ts_init=self._clock.timestamp_ns(),
         )
 
     def _clear_client_order_aliases(self, report: OrderStatusReport) -> None:

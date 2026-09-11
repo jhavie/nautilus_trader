@@ -783,25 +783,26 @@ pub fn parse_order_status_report(
         _ => TimeInForce::Gtc,
     };
 
-    let mut client_order_id = if order.cl_ord_id.is_empty() {
+    let mut linked_ids = Vec::new();
+    let algo_client_order_id = order
+        .algo_cl_ord_id
+        .as_ref()
+        .filter(|value| !value.as_str().is_empty())
+        .map(|value| ClientOrderId::new(value.as_str()));
+    let exchange_client_order_id = if order.cl_ord_id.is_empty() {
         None
     } else {
         Some(ClientOrderId::new(order.cl_ord_id.as_str()))
     };
 
-    let mut linked_ids = Vec::new();
-
-    if let Some(algo_cl_ord_id) = order
-        .algo_cl_ord_id
-        .as_ref()
-        .filter(|value| !value.as_str().is_empty())
+    // A triggered algo child gets a new clOrdId while algoClOrdId retains the
+    // client ID of the order already tracked by Nautilus. Keep the parent as
+    // canonical so HTTP reconciliation agrees with the WebSocket parser.
+    let client_order_id = algo_client_order_id.or(exchange_client_order_id);
+    if let Some(exchange_client_id) = exchange_client_order_id
+        && Some(exchange_client_id) != client_order_id
     {
-        let algo_client_id = ClientOrderId::new(algo_cl_ord_id.as_str());
-        match &client_order_id {
-            Some(existing) if existing == &algo_client_id => {}
-            Some(_) => linked_ids.push(algo_client_id),
-            None => client_order_id = Some(algo_client_id),
-        }
+        linked_ids.push(exchange_client_id);
     }
 
     if let Some(attach_algo_cl_ord_id) = order
@@ -4298,6 +4299,40 @@ mod tests {
         assert_eq!(order_report.order_side, OrderSide::Buy);
         assert_eq!(order_report.order_type, OrderType::Market);
         assert_eq!(order_report.order_status, OrderStatus::Filled);
+    }
+
+    #[rstest]
+    fn test_parse_triggered_child_status_prefers_algo_parent_client_id() {
+        let json_data = load_test_json("http_get_orders_history.json");
+        let response: OKXResponse<OKXOrderHistory> = serde_json::from_str(&json_data).unwrap();
+        let mut okx_order = response
+            .data
+            .first()
+            .expect("Test data must have an order")
+            .clone();
+        okx_order.cl_ord_id = Ustr::from("O3911981633930121216");
+        okx_order.algo_cl_ord_id = Some(Ustr::from("BSLD9DFA96666A492A902CA"));
+        okx_order.ord_id = Ustr::from("3911981634086502400");
+        okx_order.state = OKXOrderStatus::Filled;
+
+        let report = parse_order_status_report(
+            &okx_order,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            2,
+            8,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("BSLD9DFA96666A492A902CA")),
+        );
+        assert_eq!(
+            report.linked_order_ids,
+            Some(vec![ClientOrderId::from("O3911981633930121216")]),
+        );
     }
 
     #[rstest]

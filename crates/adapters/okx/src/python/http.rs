@@ -820,6 +820,41 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests a single order status report by venue or client order identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither identifier is provided or the request fails.
+    #[pyo3(name = "request_order_status_report")]
+    #[pyo3(signature = (account_id, instrument_id, venue_order_id=None, client_order_id=None))]
+    fn py_request_order_status_report<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = client
+                .request_order_status_report(
+                    account_id,
+                    instrument_id,
+                    venue_order_id,
+                    client_order_id,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| match report {
+                Some(report) => report.into_py_any(py),
+                None => Ok(py.None()),
+            })
+        })
+    }
+
     /// Requests algo order status reports.
     ///
     /// # Errors
