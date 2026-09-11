@@ -1,3 +1,28 @@
+# NautilusTrader 1.231.10 Fork
+
+Released on 11th September 2026 (UTC).
+
+Fork patch release based on `v1.231.9`, preserving all previous fork fixes.
+
+### Fork Fixes
+- Retire an OKX conditional order when its triggered physical child is already
+  fully filled and that fill is already present on the partially filled logical
+  parent. The physical `FILLED` report is represented as cancellation of the
+  logical remainder, so reconciliation cannot replay the fill or leave the
+  order permanently open.
+- Apply the normalization to direct status updates, targeted status queries,
+  startup reconciliation, and periodic open-order recovery.
+- Cover both persisted states observed around restart: the logical parent still
+  has its original quantity, or an earlier report already resized it to the
+  physical child's filled quantity.
+
+### Scope
+The patch changes OKX standalone conditional-order terminal reconciliation
+only. It does not alter strategy signals, stop formulas, position sizing,
+average-entry calculations, attached OCO orders, or overfill validation.
+
+---
+
 # NautilusTrader 1.231.9 Fork
 
 Released on 11th September 2026 (UTC).
