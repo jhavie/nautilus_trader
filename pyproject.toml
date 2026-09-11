@@ -1,6 +1,6 @@
 [project]
 name = "nautilus_trader"
-version = "1.231.9"
+version = "1.231.10"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [

@@ -102,6 +102,9 @@ class _OKXCancelAllOrdersRoute(Enum):
 
 
 _MAX_UNREPORTED_CONDITIONAL_RECOVERIES = 20
+_ALREADY_APPLIED_CONDITIONAL_FILL_REASON = (
+    "OKX conditional child fill already applied; retired logical remainder"
+)
 
 
 class OKXExecutionClient(LiveExecutionClient):
@@ -530,6 +533,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
                 report = OrderStatusReport.from_pyo3(pyo3_report)
                 self._apply_client_order_alias(report)
+                self._normalize_already_applied_conditional_fill(report)
                 if is_algo_report:
                     self._register_algo_order_id_from_report(report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
@@ -583,6 +587,7 @@ class OKXExecutionClient(LiveExecutionClient):
             report = await self._generate_unreported_conditional_order_status_report(order)
             if report is None:
                 continue
+            self._normalize_already_applied_conditional_fill(report)
             if report.client_order_id in reported_client_order_ids:
                 continue
             if report.cancel_reason == RECONCILIATION_ALIAS_RETIREMENT_REASON:
@@ -722,17 +727,21 @@ class OKXExecutionClient(LiveExecutionClient):
                         requested_client_order_id=command.client_order_id,
                         report=report,
                     )
+                    self._normalize_already_applied_conditional_fill(report)
                     self._log.debug(f"Received {report}", LogColor.MAGENTA)
                     return report
         except (asyncio.CancelledError, Exception) as e:
             self._log_report_error(e, "OrderStatusReport")
 
         if canonical_requested_id is not None:
-            return await self._resolve_algo_fallback(
+            report = await self._resolve_algo_fallback(
                 canonical_requested_id,
                 command,
                 pyo3_instrument_id,
             )
+            if report is not None:
+                self._normalize_already_applied_conditional_fill(report)
+            return report
 
         return None
 
@@ -3067,6 +3076,8 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             return
 
+        self._normalize_already_applied_conditional_fill(report, order)
+
         if order.is_closed:
             return
 
@@ -3293,6 +3304,40 @@ class OKXExecutionClient(LiveExecutionClient):
             self._clear_client_order_aliases(report)
         else:
             self._log.warning(f"Received unhandled OrderStatusReport: {report}")
+
+    def _normalize_already_applied_conditional_fill(
+        self,
+        report: OrderStatusReport,
+        order: Order | None = None,
+    ) -> None:
+        if not isinstance(report, OrderStatusReport) or report.client_order_id is None:
+            return
+
+        order = order or self._cache.order(report.client_order_id)
+        if (
+            order is None
+            or order.status != OrderStatus.PARTIALLY_FILLED
+            or order.order_list_id is not None
+            or not self._is_conditional_order(order)
+            or report.order_status != OrderStatus.FILLED
+            or report.filled_qty <= 0
+            or report.filled_qty != report.quantity
+            or report.filled_qty != order.filled_qty
+            or report.quantity > order.quantity
+        ):
+            return
+
+        physical_quantity = report.quantity
+        report.order_status = OrderStatus.CANCELED
+        report.quantity = order.quantity
+        report.price = order.price if order.has_price else None
+        report.trigger_price = order.trigger_price if order.has_trigger_price else None
+        report.cancel_reason = _ALREADY_APPLIED_CONDITIONAL_FILL_REASON
+        self._log.info(
+            "Retiring OKX conditional order whose terminal child fill is already cached: "
+            f"{order.client_order_id!r}, physical_quantity={physical_quantity}, "
+            f"logical_quantity={order.quantity}",
+        )
 
     def _handle_order_update(self, order: Any, report: OrderStatusReport) -> None:
         self.generate_order_updated(

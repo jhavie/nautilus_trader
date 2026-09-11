@@ -324,6 +324,74 @@ def test_direct_accepted_preserves_uncached_order(direct_accepted_case):
     assert captured == []
 
 
+@pytest.mark.live_components
+@pytest.mark.parametrize("restored_resize", [False, True])
+def test_terminal_conditional_report_retires_order_when_child_fill_already_applied(
+    direct_accepted_case,
+    instrument,
+    restored_resize,
+):
+    client, order, captured, _ = direct_accepted_case
+    child_venue_order_id = VenueOrderId("child-already-filled")
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=client.account_id,
+            venue_order_id=child_venue_order_id,
+        ),
+    )
+    filled_quantity = Quantity.from_str("5.000000")
+    order.apply(
+        TestEventStubs.order_filled(
+            order,
+            instrument,
+            account_id=client.account_id,
+            venue_order_id=child_venue_order_id,
+            trade_id=TradeId("already-applied-child-fill"),
+            last_qty=filled_quantity,
+            ts_event=20,
+        ),
+    )
+    assert order.status == OrderStatus.PARTIALLY_FILLED
+    if restored_resize:
+        order.apply(
+            TestEventStubs.order_updated(
+                order,
+                quantity=filled_quantity,
+                ts_event=25,
+            ),
+        )
+    logical_quantity = order.quantity
+
+    client._handle_internal_order_status_report(
+        OrderStatusReport(
+            account_id=client.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=child_venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.FILLED,
+            quantity=filled_quantity,
+            filled_qty=filled_quantity,
+            avg_px=1.0,
+            trigger_price=order.trigger_price,
+            trigger_type=order.trigger_type,
+            reduce_only=True,
+            report_id=TestIdStubs.uuid(),
+            ts_accepted=10,
+            ts_last=30,
+            ts_init=30,
+        ),
+    )
+
+    assert order.status == OrderStatus.CANCELED
+    assert order.quantity == logical_quantity
+    assert order.filled_qty == filled_quantity
+    assert [type(event) for event in captured] == [OrderCanceled]
+
+
 @pytest.mark.asyncio
 @pytest.mark.live_components
 @pytest.mark.parametrize("terminal", ["filled", "partially_filled", "canceled", "expired"])
@@ -908,6 +976,101 @@ async def test_bulk_status_recovers_unreported_open_conditional_orders(
         "RECON-",
     )
     assert len({report.venue_order_id for report in reports}) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_components
+@pytest.mark.parametrize("restored_resize", [False, True])
+@pytest.mark.parametrize("report_source", ["bulk", "recovery"])
+async def test_bulk_status_retires_terminal_child_when_fill_already_applied(
+    direct_accepted_case,
+    instrument,
+    restored_resize,
+    report_source,
+):
+    client, order, captured, exec_engine = direct_accepted_case
+    child_venue_order_id = VenueOrderId("child-already-filled")
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=client.account_id,
+            venue_order_id=child_venue_order_id,
+        ),
+    )
+    filled_quantity = Quantity.from_str("5.000000")
+    order.apply(
+        TestEventStubs.order_filled(
+            order,
+            instrument,
+            account_id=client.account_id,
+            venue_order_id=child_venue_order_id,
+            trade_id=TradeId("already-applied-child-fill"),
+            last_qty=filled_quantity,
+            ts_event=20,
+        ),
+    )
+    assert order.status == OrderStatus.PARTIALLY_FILLED
+    if restored_resize:
+        order.apply(
+            TestEventStubs.order_updated(
+                order,
+                quantity=filled_quantity,
+                ts_event=25,
+            ),
+        )
+
+    terminal_child_report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=child_venue_order_id,
+        order_side=order.side,
+        order_type=OrderType.MARKET,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.FILLED,
+        quantity=filled_quantity,
+        filled_qty=filled_quantity,
+        avg_px=1.0,
+        reduce_only=True,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=10,
+        ts_last=30,
+        ts_init=30,
+    )
+    client._cache.update_order(order)
+    command = GenerateOrderStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        open_only=report_source == "recovery",
+        command_id=TestIdStubs.uuid(),
+        ts_init=40,
+    )
+    if report_source == "bulk":
+        client._http_client.request_order_status_reports.return_value = [
+            terminal_child_report.to_pyo3(),
+        ]
+        client._generate_unreported_conditional_order_status_report = AsyncMock(
+            side_effect=AssertionError("reported bulk order must skip targeted recovery"),
+        )
+        reports = await client.generate_order_status_reports(command)
+        client._generate_unreported_conditional_order_status_report.assert_not_awaited()
+    else:
+        client._generate_unreported_conditional_order_status_report = AsyncMock(
+            return_value=terminal_child_report,
+        )
+        reports = []
+        await client._recover_unreported_conditional_order_reports(command, reports)
+
+    assert len(reports) == 1
+    assert reports[0].order_status == OrderStatus.CANCELED
+    assert reports[0].quantity == order.quantity
+    assert reports[0].filled_qty == filled_quantity
+
+    assert exec_engine._reconcile_order_report(reports[0], trades=[], is_external=False)
+    assert order.status == OrderStatus.CANCELED
+    assert order.filled_qty == filled_quantity
+    assert [type(event) for event in captured] == [OrderCanceled]
 
 
 @pytest.mark.asyncio
