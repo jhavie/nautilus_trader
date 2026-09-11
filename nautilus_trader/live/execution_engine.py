@@ -48,6 +48,7 @@ from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import QueryOrder
+from nautilus_trader.execution.reports import RECONCILIATION_ALIAS_RETIREMENT_REASON
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import ExecutionReport
 from nautilus_trader.execution.reports import FillReport
@@ -1926,7 +1927,11 @@ class LiveExecutionEngine(ExecutionEngine):
                 if instrument is not None:
                     reconciled_orders.add(order_report.client_order_id)
 
-                    if result and order_report.venue_order_id is not None:
+                    if (
+                        result
+                        and order_report.venue_order_id is not None
+                        and not self._is_reconciliation_alias_retirement(order_report)
+                    ):
                         self._ensure_venue_order_id_indexed(
                             client_order_id=order_report.client_order_id,
                             venue_order_id=order_report.venue_order_id,
@@ -2145,6 +2150,9 @@ class LiveExecutionEngine(ExecutionEngine):
 
         for order_report in mass_status._order_reports.values():
             if order_report.venue_order_id is None:
+                continue
+
+            if self._is_reconciliation_alias_retirement(order_report):
                 continue
 
             # Skip orders that were filtered (e.g., instrument not loaded)
@@ -3685,9 +3693,19 @@ class LiveExecutionEngine(ExecutionEngine):
             order=order,
             ts_now=self._clock.timestamp_ns(),
             report=report,
+            venue_order_id=(
+                order.venue_order_id if self._is_reconciliation_alias_retirement(report) else None
+            ),
         )
         self._log.debug(f"Generated {canceled}")
         self._handle_event_with_tracking(canceled)
+
+    @staticmethod
+    def _is_reconciliation_alias_retirement(report: OrderStatusReport) -> bool:
+        return (
+            report.order_status == OrderStatus.CANCELED
+            and report.cancel_reason == RECONCILIATION_ALIAS_RETIREMENT_REASON
+        )
 
     def _generate_order_expired(self, order: Order, report: OrderStatusReport) -> None:
         expired = create_order_expired_event(

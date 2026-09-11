@@ -72,6 +72,9 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
 
+RECONCILIATION_ALIAS_RETIREMENT_REASON = "Retired duplicate reconciliation alias"
+
+
 class ExecutionReport(Document):
     """
     The base class for all execution reports.
