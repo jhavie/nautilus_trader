@@ -19,12 +19,12 @@ use crate::common::enums::{OKXEnvironment, OKXRegion};
 
 // Global region (accounts registered on www.okx.com).
 const OKX_HTTP_URL: &str = "https://www.okx.com";
-const OKX_WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
-const OKX_WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
-const OKX_WS_BUSINESS_URL: &str = "wss://ws.okx.com:8443/ws/v5/business";
-const OKX_DEMO_WS_PUBLIC_URL: &str = "wss://wspap.okx.com:8443/ws/v5/public";
-const OKX_DEMO_WS_PRIVATE_URL: &str = "wss://wspap.okx.com:8443/ws/v5/private";
-const OKX_DEMO_WS_BUSINESS_URL: &str = "wss://wspap.okx.com:8443/ws/v5/business";
+const OKX_WS_PUBLIC_URL: &str = "wss://ws.okx.com/ws/v5/public";
+const OKX_WS_PRIVATE_URL: &str = "wss://ws.okx.com/ws/v5/private";
+const OKX_WS_BUSINESS_URL: &str = "wss://ws.okx.com/ws/v5/business";
+const OKX_DEMO_WS_PUBLIC_URL: &str = "wss://wspap.okx.com/ws/v5/public";
+const OKX_DEMO_WS_PRIVATE_URL: &str = "wss://wspap.okx.com/ws/v5/private";
+const OKX_DEMO_WS_BUSINESS_URL: &str = "wss://wspap.okx.com/ws/v5/business";
 
 // EEA region (European Economic Area, accounts registered on my.okx.com).
 const OKX_EEA_HTTP_URL: &str = "https://eea.okx.com";
@@ -242,24 +242,24 @@ mod tests {
 
     #[rstest]
     #[case(
-        "wss://ws.okx.com:8443/ws/v5/public",
+        "wss://ws.okx.com/ws/v5/public",
         "business",
-        "wss://ws.okx.com:8443/ws/v5/business"
+        "wss://ws.okx.com/ws/v5/business"
     )]
     #[case(
-        "wss://wseea.okx.com:8443/ws/v5/public",
+        "wss://wseea.okx.com/ws/v5/public",
         "private",
-        "wss://wseea.okx.com:8443/ws/v5/private"
+        "wss://wseea.okx.com/ws/v5/private"
     )]
     #[case(
-        "wss://wseea.okx.com:8443/ws/v5/private",
+        "wss://wseea.okx.com/ws/v5/private",
         "business",
-        "wss://wseea.okx.com:8443/ws/v5/business"
+        "wss://wseea.okx.com/ws/v5/business"
     )]
     #[case(
-        "wss://wseea.okx.com:8443/ws/v5/private/",
+        "wss://wseea.okx.com/ws/v5/private/",
         "business",
-        "wss://wseea.okx.com:8443/ws/v5/business"
+        "wss://wseea.okx.com/ws/v5/business"
     )]
     #[case(
         "wss://custom.proxy:8443/ws/v5",
