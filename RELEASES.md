@@ -1,3 +1,20 @@
+# NautilusTrader 1.231.11 Fork
+
+Released on 11th November 2026 (UTC).
+
+Fork patch release based on `v1.231.10`, preserving all previous fork fixes.
+
+### Fork Fixes
+- Migrate the built-in OKX WebSocket URLs (live, demo and EEA; public, private
+  and business) from port 8443 to the default port 443. OKX retires port 8443
+  (public internet 2026-10-31, Colo 2026-11-16) and returns error 64010 on it.
+
+### Scope
+Only the default OKX WebSocket URL constants change. Host and path are
+unchanged; REST endpoints, strategy logic and order handling are not affected.
+
+---
+
 # NautilusTrader 1.231.10 Fork
 
 Released on 11th September 2026 (UTC).
