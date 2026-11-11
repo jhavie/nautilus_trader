@@ -1286,9 +1286,9 @@ region; they take precedence over the `region` default. The EEA bases are shown 
 | Config field           | Live base                  | Demo base                     | WebSocket path    |
 | ---------------------- | -------------------------- | ----------------------------- | ----------------- |
 | `base_url_http`        | `https://eea.okx.com`      | `https://eea.okx.com`         |                   |
-| `base_url_ws_public`   | `wss://wseea.okx.com:8443` | `wss://wseeapap.okx.com:8443` | `/ws/v5/public`   |
-| `base_url_ws_private`  | `wss://wseea.okx.com:8443` | `wss://wseeapap.okx.com:8443` | `/ws/v5/private`  |
-| `base_url_ws_business` | `wss://wseea.okx.com:8443` | `wss://wseeapap.okx.com:8443` | `/ws/v5/business` |
+| `base_url_ws_public`   | `wss://wseea.okx.com`      | `wss://wseeapap.okx.com`      | `/ws/v5/public`   |
+| `base_url_ws_private`  | `wss://wseea.okx.com`      | `wss://wseeapap.okx.com`      | `/ws/v5/private`  |
+| `base_url_ws_business` | `wss://wseea.okx.com`      | `wss://wseeapap.okx.com`      | `/ws/v5/business` |
 
 For WebSocket fields, join the base and path in the same row.
 
